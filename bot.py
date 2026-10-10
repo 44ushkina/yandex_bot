@@ -32,8 +32,9 @@ async def start_web_server():
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
+    # Используем проверенный публичный client_id Яндекс Музыки для ПК
     part1 = "https://oauth.yandex.ru/authorize?"
-    part2 = "response_type=token&client_id=f4f966491ba6452180ecce48094ebe6b"
+    part2 = "response_type=token&client_id=23cabbbdc6cd491ba4b8ec639eb437c5"
     auth_url = part1 + part2
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
