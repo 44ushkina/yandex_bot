@@ -1,7 +1,8 @@
+
 import asyncio
+import json
 import logging
 import os
-import time
 import traceback
 from pathlib import Path
 
@@ -9,11 +10,8 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    FSInputFile,
+    Message, CallbackQuery, InlineKeyboardMarkup,
+    InlineKeyboardButton, FSInputFile,
 )
 from yandex_music import Client
 
@@ -36,20 +34,22 @@ def token_path(user_id):
     return DATA_DIR / f"token_{user_id}.txt"
 
 
-def get_keyboard():
+def keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔐 Войти через Яндекс", callback_data="auth_yandex")],
-        [InlineKeyboardButton(text="🎵 Найти недоступные треки", callback_data="start_search")],
+        [InlineKeyboardButton(
+            text="🔐 Войти через Яндекс",
+            callback_data="auth_yandex",
+        )],
+        [InlineKeyboardButton(
+            text="🔬 Собрать диагностический отчёт",
+            callback_data="start_search",
+        )],
     ])
-
-
-async def handle_ping(request):
-    return web.Response(text="Bot is running!")
 
 
 async def start_web_server():
     app = web.Application()
-    app.add_routes([web.get("/", handle_ping)])
+    app.router.add_get("/", lambda request: web.Response(text="Bot is running!"))
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 10000))
@@ -60,9 +60,9 @@ async def start_web_server():
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     await message.answer(
-        "Привет! Я помогу проверить треки из «Мне нравится».\n\n"
-        "Сначала войди через Яндекс, затем запусти проверку.",
-        reply_markup=get_keyboard(),
+        "Диагностический режим Яндекс Музыки.\n\n"
+        "Сначала войди через Яндекс, затем собери отчёт.",
+        reply_markup=keyboard(),
     )
 
 
@@ -72,25 +72,27 @@ async def auth_yandex(callback: CallbackQuery):
     user_id = callback.from_user.id
 
     if callback.message.chat.type != "private":
-        await callback.message.answer("Для безопасности запусти бота в личном чате.")
+        await callback.message.answer("Используй бота в личном чате.")
         return
     if user_id in auth_in_progress:
-        await callback.message.answer("Авторизация уже запущена. Проверь предыдущие сообщения.")
+        await callback.message.answer("Авторизация уже запущена.")
         return
 
     auth_in_progress.add(user_id)
-    await callback.message.answer("⏳ Запрашиваю код авторизации у Яндекса...")
+    await callback.message.answer("⏳ Запрашиваю код авторизации...")
     loop = asyncio.get_running_loop()
 
     def on_code(code):
         text = (
             "🔐 Подтверди вход в Яндекс.\n\n"
-            f"1. Открой ссылку: {code.verification_url}\n"
-            f"2. Введи код: {code.user_code}\n\n"
-            f"Код действует примерно {code.expires_in} секунд.\n"
-            "Не пересылай этот код другим людям."
+            f"Ссылка: {code.verification_url}\n"
+            f"Код: {code.user_code}\n\n"
+            f"Срок действия: около {code.expires_in} секунд.\n"
+            "Не пересылай код другим людям."
         )
-        asyncio.run_coroutine_threadsafe(bot.send_message(user_id, text), loop).result(timeout=20)
+        asyncio.run_coroutine_threadsafe(
+            bot.send_message(user_id, text), loop
+        ).result(timeout=20)
 
     def authenticate():
         client = Client()
@@ -108,61 +110,108 @@ async def auth_yandex(callback: CallbackQuery):
         except OSError:
             pass
         await callback.message.answer(
-            "✅ Вход подтверждён!\nТеперь нажми «Найти недоступные треки».",
-            reply_markup=get_keyboard(),
+            "✅ Вход подтверждён. Теперь запусти диагностику.",
+            reply_markup=keyboard(),
         )
     except Exception as error:
-        logging.error("Ошибка авторизации: %s\n%s", type(error).__name__, traceback.format_exc())
+        logging.exception("Ошибка авторизации")
         await callback.message.answer(
-            f"❌ Не получилось завершить вход: {type(error).__name__}: {error}\n\n"
-            "Попробуй ещё раз немного позже."
+            f"❌ Ошибка авторизации: {type(error).__name__}: {error}"
         )
     finally:
         auth_in_progress.discard(user_id)
 
 
-def extract_short_tracks(likes):
+def as_dict(obj):
+    """Преобразует объект библиотеки в словарь, если это возможно."""
+    if obj is None:
+        return None
+    method = getattr(obj, "to_dict", None)
+    if callable(method):
+        try:
+            result = method()
+            if isinstance(result, dict):
+                return result
+        except Exception:
+            pass
+    if isinstance(obj, dict):
+        return obj
+    return {"_repr": repr(obj)}
+
+
+def extract_likes(likes):
     items = getattr(likes, "tracks", None)
     if items is None:
         items = likes
-    result, seen = [], set()
+
+    result = []
+    seen = set()
+
     for item in items or []:
         track = getattr(item, "track", None) or item
         track_id = getattr(track, "id", None)
         if track_id is None:
             continue
         track_id = str(track_id)
-        if track_id not in seen:
-            seen.add(track_id)
-            result.append((track_id, track))
+        if track_id in seen:
+            continue
+        seen.add(track_id)
+        result.append({
+            "id": track_id,
+            "short_object": track,
+            "like_object": item,
+        })
     return result
 
 
-def artist_title(track):
-    artists = getattr(track, "artists", None) or []
-    names = ", ".join(
-        str(getattr(artist, "name", "")).strip()
-        for artist in artists if getattr(artist, "name", None)
-    ) or "Неизвестный исполнитель"
-    title = getattr(track, "title", None) or "Без названия"
-    version = getattr(track, "version", None)
-    if version:
-        title += f" ({version})"
-    return f"{names} — {title}"
+def get_value(obj, key):
+    if isinstance(obj, dict):
+        return obj.get(key)
+    return getattr(obj, key, None)
 
 
-def format_track(track, track_id=None):
-    track_id = str(track_id if track_id is not None else getattr(track, "id", "?"))
-    return f"{artist_title(track)} [ID: {track_id}]"
+def inspect_record(obj):
+    data = as_dict(obj)
+    if not isinstance(data, dict):
+        data = {"_value": str(data)}
+
+    # Дополнительно фиксируем важные поля напрямую:
+    # они могут отсутствовать в сериализованном словаре.
+    fields = (
+        "id", "title", "available", "available_for_premium_users",
+        "available_full_without_permission", "matched_track",
+        "substituted", "albums", "artists", "duration_ms",
+        "storage_dir", "type", "content_warning",
+    )
+    extra = {}
+    for key in fields:
+        try:
+            value = get_value(obj, key)
+            if value is not None:
+                extra[key] = as_dict(value) if not isinstance(
+                    value, (str, int, float, bool, list, dict)
+                ) else value
+        except Exception:
+            pass
+
+    return {"data": data, "important_fields": extra}
 
 
-def linked_track_id(track):
-    """Read a linked/matched track ID if the library exposes one."""
-    value = getattr(track, "matched_track", None)
+def extract_linked_id(obj):
+    value = get_value(obj, "matched_track")
+    if value is None:
+        value = get_value(obj, "substituted")
+
     if value is None:
         return None
+
     if isinstance(value, (str, int)):
         candidate = str(value).strip()
+    elif isinstance(value, dict):
+        candidate = value.get("id") or value.get("track_id")
+        if candidate is None:
+            return None
+        candidate = str(candidate).strip()
     else:
         candidate = getattr(value, "id", None)
         if candidate is None:
@@ -170,131 +219,150 @@ def linked_track_id(track):
         if candidate is None:
             return None
         candidate = str(candidate).strip()
-    return candidate if candidate and candidate.lower() != "none" else None
+
+    return candidate if candidate and candidate != "None" else None
 
 
-def check_tracks(access_token):
+def run_diagnostics(access_token, output_path):
     client = Client(access_token)
     client.init()
 
     likes = client.users_likes_tracks()
-    short_tracks = extract_short_tracks(likes)
-    if not short_tracks and getattr(client, "me", None):
+    liked = extract_likes(likes)
+
+    if not liked and getattr(client, "me", None):
         likes = client.users_likes_tracks(client.me.account.uid)
-        short_tracks = extract_short_tracks(likes)
+        liked = extract_likes(likes)
 
-    if not short_tracks:
-        return {
-            "total": 0, "checked": 0, "unavailable": [],
-            "unresolved": [], "linked": [], "linked_unavailable": [],
-            "linked_checked": 0,
-        }
-
-    short_by_id = dict(short_tracks)
-    ids = list(short_by_id)
-    fetched_by_id = {}
-    unavailable_by_id = {}
-    unresolved_by_id = {}
-    linked_by_id = {}
-    linked_ids_to_check = set()
+    records = {item["id"]: item for item in liked}
+    ids = list(records)
+    full_tracks = {}
+    errors = []
     checked_ids = set()
-    batch_size = 100
 
-    # First pass: check every liked track and collect explicit matched_track IDs.
-    for start in range(0, len(ids), batch_size):
-        batch = ids[start:start + batch_size]
+    # Запрашиваем полные объекты пачками.
+    for start in range(0, len(ids), 100):
+        batch = ids[start:start + 100]
         try:
-            tracks = client.tracks(batch) or []
+            response = client.tracks(batch) or []
         except Exception as error:
-            logging.warning("Ошибка пачки треков: %s", type(error).__name__)
-            for track_id in batch:
-                unresolved_by_id[track_id] = (
-                    format_track(short_by_id[track_id], track_id)
-                    + f" [ошибка запроса: {type(error).__name__}]"
-                )
+            errors.append({
+                "stage": "bulk_tracks",
+                "ids": batch,
+                "error": type(error).__name__,
+                "message": str(error),
+            })
             continue
 
-        found = set()
-        for track in tracks:
-            if track is None or getattr(track, "id", None) is None:
+        for track in response:
+            track_id = get_value(track, "id")
+            if track_id is None:
                 continue
-            track_id = str(track.id)
-            found.add(track_id)
+            track_id = str(track_id)
+            full_tracks[track_id] = track
             checked_ids.add(track_id)
-            fetched_by_id[track_id] = track
 
-            available = getattr(track, "available", None)
-            if available is False:
-                unavailable_by_id[track_id] = format_track(track, track_id)
-            elif available is not True:
-                unresolved_by_id[track_id] = (
-                    format_track(track, track_id) + " [статус доступности не определён]"
-                )
+    # Записываем данные всех лайков, включая краткую запись и полную,
+    # если API её вернул.
+    output_records = []
+    linked_ids = set()
+    unavailable_ids = []
 
-            matched_id = linked_track_id(track)
-            if matched_id and matched_id != track_id:
-                linked_by_id.setdefault(track_id, (track, matched_id))
-                linked_ids_to_check.add(matched_id)
+    for track_id, item in records.items():
+        short_obj = item["short_object"]
+        full_obj = full_tracks.get(track_id)
+        short_info = inspect_record(short_obj)
+        full_info = inspect_record(full_obj) if full_obj else None
 
-        for track_id in batch:
-            if track_id not in found:
-                unresolved_by_id[track_id] = (
-                    format_track(short_by_id[track_id], track_id) + " [API не вернул трек]"
-                )
+        available = get_value(full_obj, "available") if full_obj else None
+        if available is False:
+            unavailable_ids.append(track_id)
 
-    # Second pass: query linked IDs separately. A match is a clue, not proof
-    # that the original liked track has been deleted.
-    linked_status = {}
-    linked_list = sorted(linked_ids_to_check)
-    for start in range(0, len(linked_list), batch_size):
-        batch = linked_list[start:start + batch_size]
+        linked_id = extract_linked_id(full_obj or short_obj)
+        if linked_id and linked_id != track_id:
+            linked_ids.add(linked_id)
+
+        output_records.append({
+            "liked_track_id": track_id,
+            "liked_track_short": short_info,
+            "liked_track_full": full_info,
+            "api_returned_full_track": full_obj is not None,
+            "available": available,
+            "matched_or_substituted_id": linked_id,
+        })
+
+    # Повторно запрашиваем недоступные ID по одному.
+    # Это может выявить различия между пакетным и одиночным ответом.
+    individual_checks = []
+    for track_id in unavailable_ids:
+        item = records[track_id]
+        result = {
+            "id": track_id,
+            "liked_track": inspect_record(item["short_object"]),
+        }
         try:
-            tracks = client.tracks(batch) or []
-            returned = set()
-            for track in tracks:
-                if track is None or getattr(track, "id", None) is None:
-                    continue
-                track_id = str(track.id)
-                returned.add(track_id)
-                linked_status[track_id] = (
-                    getattr(track, "available", None),
-                    format_track(track, track_id),
-                )
-            for track_id in batch:
-                if track_id not in returned:
-                    linked_status[track_id] = (None, None)
+            response = client.tracks([track_id]) or []
+            if response:
+                track = response[0]
+                result["single_request"] = inspect_record(track)
+                result["single_request_available"] = get_value(track, "available")
+            else:
+                result["single_request"] = None
+                result["single_request_available"] = None
+                result["note"] = "API не вернул запись при одиночном запросе"
         except Exception as error:
-            logging.warning("Ошибка проверки связанных ID: %s", type(error).__name__)
-            for track_id in batch:
-                linked_status[track_id] = (None, None)
+            result["error"] = type(error).__name__
+            result["message"] = str(error)
+        individual_checks.append(result)
 
-    linked_candidates = []
-    linked_unavailable = []
-    for original_id, (original_track, match_id) in linked_by_id.items():
-        match_status, match_label = linked_status.get(match_id, (None, None))
-        original_label = format_track(original_track, original_id)
-        if match_status is False:
-            linked_unavailable.append(
-                f"{original_label}\n  Связанный ID {match_id} тоже помечен недоступным"
-            )
-        elif match_status is True:
-            linked_candidates.append(
-                f"{original_label}\n  Связанный трек: {match_label}"
-            )
-        else:
-            linked_candidates.append(
-                f"{original_label}\n  Связанный ID: {match_id} (статус не определён)"
-            )
+    # Отдельно проверяем ID, связанные через matched_track/substituted.
+    linked_checks = []
+    linked_list = sorted(linked_ids)
+    for start in range(0, len(linked_list), 100):
+        batch = linked_list[start:start + 100]
+        try:
+            response = client.tracks(batch) or []
+            returned = {str(get_value(track, "id")): track for track in response
+                        if get_value(track, "id") is not None}
+            for linked_id in batch:
+                track = returned.get(linked_id)
+                linked_checks.append({
+                    "id": linked_id,
+                    "returned": track is not None,
+                    "record": inspect_record(track) if track is not None else None,
+                    "available": get_value(track, "available") if track is not None else None,
+                })
+        except Exception as error:
+            errors.append({
+                "stage": "linked_tracks",
+                "ids": batch,
+                "error": type(error).__name__,
+                "message": str(error),
+            })
 
-    return {
-        "total": len(ids),
-        "checked": len(checked_ids),
-        "unavailable": list(unavailable_by_id.values()),
-        "unresolved": list(unresolved_by_id.values()),
-        "linked": linked_candidates,
-        "linked_unavailable": linked_unavailable,
-        "linked_checked": len(linked_status),
+    report = {
+        "report_type": "yandex_music_diagnostic",
+        "warning": (
+            "available=False не доказывает удаление. "
+            "Данные показывают только то, что вернул API на момент проверки."
+        ),
+        "summary": {
+            "unique_liked_tracks": len(ids),
+            "full_tracks_returned": len(checked_ids),
+            "available_false": len(unavailable_ids),
+            "unavailable_ids": unavailable_ids,
+            "linked_ids_found": len(linked_ids),
+            "linked_ids": sorted(linked_ids),
+            "errors_count": len(errors),
+        },
+        "tracks": output_records,
+        "individual_checks_for_unavailable": individual_checks,
+        "checks_for_linked_ids": linked_checks,
+        "errors": errors,
     }
+
+    with open(output_path, "w", encoding="utf-8") as file:
+        json.dump(report, file, ensure_ascii=False, indent=2, default=str)
 
 
 @dp.callback_query(F.data == "start_search")
@@ -303,84 +371,53 @@ async def start_search(callback: CallbackQuery):
     user_id = callback.from_user.id
 
     if callback.message.chat.type != "private":
-        await callback.message.answer("Для безопасности используй бота в личном чате.")
+        await callback.message.answer("Используй бота в личном чате.")
         return
     if user_id in search_in_progress:
-        await callback.message.answer("⏳ Проверка уже идёт. Дождись отчёта.")
+        await callback.message.answer("⏳ Диагностика уже выполняется.")
         return
 
     path = token_path(user_id)
     if not path.exists():
         await callback.message.answer(
-            "Сначала нажми «Войти через Яндекс».", reply_markup=get_keyboard()
+            "Сначала нажми «Войти через Яндекс».", reply_markup=keyboard()
         )
         return
+
     access_token = path.read_text(encoding="utf-8").strip()
     if not access_token:
-        await callback.message.answer("Токен не найден. Войди через Яндекс заново.")
+        await callback.message.answer("Токен пустой. Войди через Яндекс заново.")
         return
 
     search_in_progress.add(user_id)
     status = await callback.message.answer(
-        "⏳ Загружаю «Мне нравится». Проверяю доступность треков и связанные ID.\n"
-        "Большая коллекция может проверяться несколько минут."
+        "⏳ Собираю подробные данные по лайкам.\n"
+        "Не закрывай чат; большая коллекция может проверяться несколько минут."
     )
 
+    report_path = DATA_DIR / f"diagnostic_{user_id}.json"
     try:
-        result = await asyncio.to_thread(check_tracks, access_token)
-        report_path = DATA_DIR / f"report_{user_id}.txt"
-
-        with report_path.open("w", encoding="utf-8") as file:
-            file.write("ОТЧЁТ ПРОВЕРКИ ЯНДЕКС МУЗЫКИ\n\n")
-            file.write(f"Уникальных треков в «Мне нравится»: {result['total']}\n")
-            file.write(f"Треков, полученных через API: {result['checked']}\n")
-            file.write(f"API явно пометил недоступными: {len(result['unavailable'])}\n")
-            file.write(f"Не удалось однозначно проверить: {len(result['unresolved'])}\n")
-            file.write(f"Найдено связанных ID: {result['linked_checked']}\n\n")
-
-            file.write("НЕДОСТУПНЫЕ ПО ДАННЫМ API\n")
-            file.write("\n".join(result["unavailable"]) if result["unavailable"] else "Не обнаружены")
-            file.write("\n\nСВЯЗАННЫЕ ТРЕКИ — КАНДИДАТЫ ДЛЯ ДОПОЛНИТЕЛЬНОЙ ПРОВЕРКИ\n")
-            file.write(
-                "\n\n".join(result["linked"])
-                if result["linked"] else "Связанных записей не найдено"
-            )
-            file.write("\n\nСВЯЗАННЫЕ ID, КОТОРЫЕ API ТОЖЕ ПОМЕТИЛ НЕДОСТУПНЫМИ\n")
-            file.write(
-                "\n\n".join(result["linked_unavailable"])
-                if result["linked_unavailable"] else "Таких записей не обнаружено"
-            )
-            file.write("\n\nТРЕБУЮТ ДОПОЛНИТЕЛЬНОЙ ПРОВЕРКИ\n")
-            file.write(
-                "\n".join(result["unresolved"])
-                if result["unresolved"] else "Нет"
-            )
-            file.write(
-                "\n\nВАЖНО: matched_track/связанный ID сам по себе не доказывает, "
-                "что исходный трек удалён. Подтверждённо недоступными считаются только "
-                "записи, для которых API вернул available=False. Отсутствие записи в API "
-                "тоже не доказывает удаление."
-            )
+        await asyncio.to_thread(run_diagnostics, access_token, report_path)
 
         await bot.send_document(
             chat_id=user_id,
             document=FSInputFile(report_path),
             caption=(
-                "✅ Проверка завершена.\n"
-                f"Всего лайков: {result['total']}\n"
-                f"Явно недоступных по API: {len(result['unavailable'])}\n"
-                f"Связанных ID проверено: {result['linked_checked']}\n"
-                f"Кандидатов со связанными треками: {len(result['linked'])}\n"
-                f"Неоднозначных случаев: {len(result['unresolved'])}\n\n"
-                "Связанные треки вынесены отдельно: это зацепки для проверки, "
-                "а не доказательство удаления."
+                "✅ Диагностика завершена.\n"
+                "Файл содержит данные по всем лайкам, ответы API "
+                "и отдельные проверки недоступных и связанных ID.\n"
+                "Это диагностический отчёт, а не готовый список удалённых треков."
             ),
         )
         report_path.unlink(missing_ok=True)
-
     except Exception as error:
-        logging.error("Ошибка проверки: %s\n%s", type(error).__name__, traceback.format_exc())
-        await status.answer(f"❌ Ошибка проверки: {type(error).__name__}: {error}")
+        logging.error(
+            "Ошибка диагностики: %s\n%s",
+            type(error).__name__, traceback.format_exc()
+        )
+        await status.answer(
+            f"❌ Ошибка: {type(error).__name__}: {error}"
+        )
     finally:
         search_in_progress.discard(user_id)
 
