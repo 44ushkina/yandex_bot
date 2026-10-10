@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import os
+import time
 import traceback
 from pathlib import Path
 
@@ -17,20 +18,21 @@ from aiogram.types import (
 )
 from yandex_music import Client
 
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Не задан BOT_TOKEN в Environment на Render")
 
 logging.basicConfig(level=logging.INFO)
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Файлы токенов сохраняются на диске Render.
-# При перезапуске бесплатного сервиса они могут пропасть.
 DATA_DIR = Path("/tmp/yandex_music_bot")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 auth_in_progress = set()
+search_in_progress = set()
 
 
 def token_path(user_id):
@@ -38,16 +40,22 @@ def token_path(user_id):
 
 
 def get_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="🔐 Войти через Яндекс",
-            callback_data="auth_yandex",
-        )],
-        [InlineKeyboardButton(
-            text="🎵 Найти недоступные треки",
-            callback_data="start_search",
-        )],
-    ])
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔐 Войти через Яндекс",
+                    callback_data="auth_yandex",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🎵 Найти недоступные треки",
+                    callback_data="start_search",
+                )
+            ],
+        ]
+    )
 
 
 async def handle_ping(request):
@@ -57,11 +65,14 @@ async def handle_ping(request):
 async def start_web_server():
     app = web.Application()
     app.add_routes([web.get("/", handle_ping)])
+
     runner = web.AppRunner(app)
     await runner.setup()
+
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
+
     logging.info("Web server started on port %s", port)
 
 
@@ -92,6 +103,7 @@ async def auth_yandex(callback: CallbackQuery):
         return
 
     auth_in_progress.add(user_id)
+
     await callback.message.answer(
         "⏳ Запрашиваю код авторизации у Яндекса..."
     )
@@ -99,8 +111,6 @@ async def auth_yandex(callback: CallbackQuery):
     loop = asyncio.get_running_loop()
 
     def on_code(code):
-        # Выводим в Telegram только ссылку и код подтверждения.
-        # Сам токен никогда не отправляем в чат.
         text = (
             "🔐 Подтверди вход в Яндекс.\n\n"
             f"1. Открой ссылку: {code.verification_url}\n"
@@ -108,6 +118,7 @@ async def auth_yandex(callback: CallbackQuery):
             f"Код действует примерно {code.expires_in} секунд.\n"
             "Не пересылай этот код другим людям."
         )
+
         future = asyncio.run_coroutine_threadsafe(
             bot.send_message(user_id, text),
             loop,
@@ -117,9 +128,10 @@ async def auth_yandex(callback: CallbackQuery):
     def authenticate():
         client = Client()
         token = client.device_auth(on_code=on_code)
-        # Проверяем, что токен действительно работает.
+
         client = Client(token.access_token)
         client.init()
+
         return token.access_token
 
     try:
@@ -127,13 +139,14 @@ async def auth_yandex(callback: CallbackQuery):
 
         path = token_path(user_id)
         path.write_text(access_token, encoding="utf-8")
+
         try:
             os.chmod(path, 0o600)
         except OSError:
             pass
 
         await callback.message.answer(
-            "✅ Вход подтверждён! Токен сохранён на сервере.\n"
+            "✅ Вход подтверждён!\n"
             "Теперь нажми «Найти недоступные треки».",
             reply_markup=get_keyboard(),
         )
@@ -144,27 +157,60 @@ async def auth_yandex(callback: CallbackQuery):
             type(error).__name__,
             traceback.format_exc(),
         )
+
         await callback.message.answer(
             "❌ Не получилось завершить вход: "
             f"{type(error).__name__}: {error}\n\n"
             "Попробуй ещё раз немного позже."
         )
+
     finally:
         auth_in_progress.discard(user_id)
 
 
-def extract_track_ids(likes):
+def extract_short_tracks(likes):
     items = getattr(likes, "tracks", None)
+
     if items is None:
         items = likes
 
-    ids = []
+    result = []
+    seen = set()
+
     for item in items or []:
         track = getattr(item, "track", None) or item
         track_id = getattr(track, "id", None)
-        if track_id is not None:
-            ids.append(str(track_id))
-    return list(dict.fromkeys(ids))
+
+        if track_id is None:
+            continue
+
+        track_id = str(track_id)
+
+        if track_id in seen:
+            continue
+
+        seen.add(track_id)
+        result.append((track_id, track))
+
+    return result
+
+
+def format_track(track, track_id):
+    artists = getattr(track, "artists", None) or []
+
+    artist_names = ", ".join(
+        artist.name
+        for artist in artists
+        if getattr(artist, "name", None)
+    ) or "Неизвестный исполнитель"
+
+    title = getattr(track, "title", None) or "Без названия"
+
+    version = getattr(track, "version", None)
+    if version:
+        title += f" ({version})"
+
+    return f"{artist_names} — {title} [ID: {track_id}]"
 
 
 def check_tracks(access_token):
@@ -172,50 +218,123 @@ def check_tracks(access_token):
     client.init()
 
     likes = client.users_likes_tracks()
-    ids = extract_track_ids(likes)
+    short_tracks = extract_short_tracks(likes)
 
-    if not ids and getattr(client, "me", None):
+    if not short_tracks and getattr(client, "me", None):
         uid = client.me.account.uid
         likes = client.users_likes_tracks(uid)
-        ids = extract_track_ids(likes)
+        short_tracks = extract_short_tracks(likes)
 
-    if not ids:
-        return 0, [], []
+    if not short_tracks:
+        return 0, [], [], []
+
+    short_by_id = dict(short_tracks)
+    ids = list(short_by_id.keys())
 
     unavailable = []
     unresolved = []
+    checked_ids = set()
     batch_size = 100
 
     for start in range(0, len(ids), batch_size):
         batch = ids[start:start + batch_size]
-        result = client.tracks(batch) or []
+
+        try:
+            tracks = client.tracks(batch) or []
+        except Exception as error:
+            logging.warning(
+                "Ошибка при проверке пачки: %s",
+                type(error).__name__,
+            )
+
+            unresolved.extend(
+                format_track(short_by_id[track_id], track_id)
+                + f" [ошибка пачки: {type(error).__name__}]"
+                for track_id in batch
+            )
+            continue
+
         found = set()
 
-        for track in result:
+        for track in tracks:
             if track is None:
                 continue
 
             track_id = getattr(track, "id", None)
-            if track_id is not None:
-                found.add(str(track_id))
+            if track_id is None:
+                continue
 
-            if getattr(track, "available", None) is False:
-                artists = getattr(track, "artists", None) or []
-                artist_names = ", ".join(
-                    a.name for a in artists if getattr(a, "name", None)
-                ) or "Неизвестный исполнитель"
-                title = getattr(track, "title", None) or "Без названия"
-                version = getattr(track, "version", None)
-                if version:
-                    title += f" ({version})"
-                unavailable.append(f"{artist_names} — {title}")
+            track_id = str(track_id)
+            found.add(track_id)
+            checked_ids.add(track_id)
 
-        # Если API не вернул ID, отмечаем его отдельно,
-        # а не объявляем удалённым без подтверждения.
-        unresolved.extend(track_id for track_id in batch
-                          if track_id not in found)
+            available = getattr(track, "available", None)
 
-    return len(ids), unavailable, unresolved
+            if available is False:
+                unavailable.append(format_track(track, track_id))
+                continue
+
+            if available is True:
+                continue
+
+            # Если API не дал однозначного статуса,
+            # пробуем получить полную информацию о треке.
+            short_track = short_by_id.get(track_id)
+
+            if short_track is None:
+                unresolved.append(
+                    format_track(track, track_id)
+                    + " [нет исходной записи]"
+                )
+                continue
+
+            try:
+                detailed_track = short_track.fetch_track()
+
+                if detailed_track is None:
+                    unresolved.append(
+                        format_track(short_track, track_id)
+                        + " [подробная информация не получена]"
+                    )
+                    continue
+
+                detailed_available = getattr(
+                    detailed_track, "available", None
+                )
+
+                if detailed_available is False:
+                    unavailable.append(
+                        format_track(detailed_track, track_id)
+                    )
+                elif detailed_available is not True:
+                    unresolved.append(
+                        format_track(detailed_track, track_id)
+                        + " [статус доступности не определён]"
+                    )
+
+            except Exception as error:
+                unresolved.append(
+                    format_track(short_track, track_id)
+                    + f" [ошибка подробного запроса: "
+                    f"{type(error).__name__}]"
+                )
+
+            time.sleep(0.05)
+
+        # Если API совсем не вернул ID, это не означает,
+        # что трек точно удалён.
+        for track_id in batch:
+            if track_id not in found:
+                unresolved.append(
+                    format_track(short_by_id[track_id], track_id)
+                    + " [API не вернул трек]"
+                )
+
+    # Убираем повторения, сохраняя порядок.
+    unavailable = list(dict.fromkeys(unavailable))
+    unresolved = list(dict.fromkeys(unresolved))
+
+    return len(ids), unavailable, unresolved, len(checked_ids)
 
 
 @dp.callback_query(F.data == "start_search")
@@ -229,7 +348,14 @@ async def start_search(callback: CallbackQuery):
         )
         return
 
+    if user_id in search_in_progress:
+        await callback.message.answer(
+            "⏳ Проверка уже идёт. Дождись отчёта."
+        )
+        return
+
     path = token_path(user_id)
+
     if not path.exists():
         await callback.message.answer(
             "Сначала нажми «Войти через Яндекс».",
@@ -238,43 +364,67 @@ async def start_search(callback: CallbackQuery):
         return
 
     access_token = path.read_text(encoding="utf-8").strip()
+
     if not access_token:
         await callback.message.answer(
             "Токен не найден. Войди через Яндекс заново."
         )
         return
 
+    search_in_progress.add(user_id)
+
     status = await callback.message.answer(
-        "⏳ Загружаю «Мне нравится» и проверяю треки..."
+        "⏳ Загружаю «Мне нравится» и проверяю треки.\n"
+        "Большая коллекция может проверяться несколько минут."
     )
 
     try:
-        total, unavailable, unresolved = await asyncio.to_thread(
-            check_tracks, access_token
+        total, unavailable, unresolved, checked = (
+            await asyncio.to_thread(check_tracks, access_token)
         )
 
         report_path = DATA_DIR / f"report_{user_id}.txt"
+
         with report_path.open("w", encoding="utf-8") as file:
             file.write("ОТЧЁТ ПРОВЕРКИ ЯНДЕКС МУЗЫКИ\n\n")
-            file.write(f"Треков в списке: {total}\n")
-            file.write(f"API явно пометил недоступными: {len(unavailable)}\n")
-            file.write(f"Не удалось проверить: {len(unresolved)}\n\n")
+            file.write(f"Уникальных треков в списке: {total}\n")
+            file.write(f"Треков, полученных через API: {checked}\n")
+            file.write(
+                f"API явно пометил недоступными: {len(unavailable)}\n"
+            )
+            file.write(f"Не удалось однозначно проверить: {len(unresolved)}\n\n")
 
             file.write("НЕДОСТУПНЫЕ ПО ДАННЫМ API:\n")
-            file.write("\n".join(unavailable) if unavailable else "Не обнаружены")
-            file.write("\n\nID, которые API не вернул:\n")
-            file.write("\n".join(unresolved) if unresolved else "Нет")
+            file.write(
+                "\n".join(unavailable)
+                if unavailable
+                else "Не обнаружены"
+            )
+
+            file.write("\n\nТРЕБУЮТ ДОПОЛНИТЕЛЬНОЙ ПРОВЕРКИ:\n")
+            file.write(
+                "\n".join(unresolved)
+                if unresolved
+                else "Нет"
+            )
+
+            file.write(
+                "\n\nПримечание: отсутствие трека в ответе API "
+                "не доказывает, что он удалён."
+            )
 
         await bot.send_document(
             chat_id=user_id,
             document=FSInputFile(report_path),
             caption=(
-                f"Проверка завершена.\n"
-                f"Получено треков: {total}\n"
+                "✅ Проверка завершена.\n"
+                f"Всего в «Мне нравится»: {total}\n"
+                f"Получено API: {checked}\n"
                 f"Явно недоступных: {len(unavailable)}\n"
-                f"Не удалось проверить: {len(unresolved)}"
+                f"Не удалось однозначно проверить: {len(unresolved)}"
             ),
         )
+
         report_path.unlink(missing_ok=True)
 
     except Exception as error:
@@ -283,13 +433,18 @@ async def start_search(callback: CallbackQuery):
             type(error).__name__,
             traceback.format_exc(),
         )
+
         await status.answer(
             f"❌ Ошибка проверки: {type(error).__name__}: {error}"
         )
 
+    finally:
+        search_in_progress.discard(user_id)
+
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
+
     await asyncio.gather(
         start_web_server(),
         dp.start_polling(bot, polling_timeout=30),
