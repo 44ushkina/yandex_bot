@@ -1,19 +1,34 @@
 import asyncio
 import logging
 import os
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.filters import CommandStart
 from yandex_music import Client
 
-# Твой токен бота
 BOT_TOKEN = "8685013659:AAErk618IFRBUROGOzP8jKJzJs9A2rp2AH8"
 
-# Настраиваем логирование, чтобы видеть всё, что происходит
 logging.basicConfig(level=logging.INFO)
-
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+# --- МИНИ-СЕРВЕР ДЛЯ RENDER (чтобы он не ругался на закрытые порты) ---
+async def handle_ping(request):
+    return web.Response(text="Bot is running!")
+
+async def start_web_server():
+    app = web.Application()
+    app.add_routes([web.get('/', handle_ping)])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    # Render передает порт через переменную окружения PORT, по умолчанию берем 10000
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"Web server started on port {port}")
+# ------------------------------------------------------------------
 
 def get_start_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -121,9 +136,11 @@ async def start_search(callback: CallbackQuery):
         await callback.message.answer(f"❌ Произошла ошибка: {str(e)}\n\nВозможно, токен недействителен или устарел.")
 
 async def main():
-    # Очищаем зависшие вебхуки и принудительно запускаем polling с короткими таймаутами
+    # Запускаем веб-сервер для Render, чтобы он видел открытый порт
+    await start_web_server()
+    
     await bot.delete_webhook(drop_pending_updates=True)
-    print("🤖 Бот запущен и ожидает сообщения в Telegram...")
+    logging.info("🤖 Бот успешно запущен и работает!")
     await dp.start_polling(bot, polling_timeout=30)
 
 if __name__ == "__main__":
