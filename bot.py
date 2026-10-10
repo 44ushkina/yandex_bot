@@ -32,41 +32,35 @@ async def start_web_server():
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    # Используем твой личный зарегистрированный Client ID
-    auth_url = "https://oauth.yandex.ru/authorize?response_type=token&client_id=f4f966491ba6452180ecce48094ebe6b"
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔐 Авторизоваться в Яндекс Музыке", url=auth_url)]
-    ])
-    
     text = (
         "Привет! Я бот для поиска удаленных треков из Яндекс Музыки.\n\n"
-        "Чтобы я мог проверить твои лайки, мне нужен **OAuth-токен**.\n\n"
-        "👉 **Как получить токен:**\n"
-        "1. Нажми кнопку ниже и разреши доступ.\n"
-        "2. Скопируй длинный токен из появившейся страницы.\n"
-        "3. Вернись сюда и отправь его мне ответным сообщением!"
+        "Поскольку Яндекс заблокировал сторонние OAuth-приложения, мы используем надежный вход по куке сессии.\n\n"
+        "👉 **Как получить куку Session_id:**\n"
+        "1. Открой [music.yandex.ru](https://music.yandex.ru/) в браузере (ты должна быть авторизована).\n"
+        "2. Нажми `F12` -> вкладка **Application** (Приложение) -> **Cookies** -> `https://yandex.ru`.\n"
+        "3. Найди параметр **Session_id** и скопируй его значение.\n"
+        "4. Отправь скопированное значение мне ответным сообщением!"
     )
-    await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
+    await message.answer(text, parse_mode="Markdown", disable_web_page_preview=True)
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def handle_token(message: Message):
-    token = message.text.strip()
+    cookie_value = message.text.strip()
     
-    if len(token) < 10 or " " in token:
-        await message.answer("❌ Это не похоже на токен. Пожалуйста, отправь токен, полученный после авторизации.")
+    if len(cookie_value) < 15 or " " in cookie_value:
+        await message.answer("❌ Это не похоже на Session_id. Пожалуйста, скопируй точное значение куки из браузера.")
         return
 
     user_id = message.from_user.id
     with open(f"token_{user_id}.txt", "w") as f:
-        f.write(token)
+        f.write(cookie_value)
         
     search_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎵 Найти удаленные треки", callback_data="start_search")]
     ])
     
     await message.answer(
-        "✅ Токен успешно принят!\n\nНажми кнопку ниже, чтобы запустить проверку.",
+        "✅ Кука успешно принята!\n\nНажми кнопку ниже, чтобы запустить проверку плейлиста.",
         reply_markup=search_keyboard
     )
 
@@ -76,16 +70,17 @@ async def start_search(callback: CallbackQuery):
     token_file = f"token_{user_id}.txt"
     
     if not os.path.exists(token_file):
-        await callback.message.answer("⚠️ Сначала отправь мне свой OAuth-токен!")
+        await callback.message.answer("⚠️ Сначала отправь мне свою куку Session_id!")
         return
         
     with open(token_file, "r") as f:
-        token = f.read().strip()
+        session_id = f.read().strip()
         
-    await callback.message.edit_text("⏳ Подключаюсь к аккаунту Яндекс Музыки...")
+    await callback.message.edit_text("⏳ Подключаюсь к аккаунту Яндекс Музыки через сессию...")
     
     try:
-        client = Client(token)
+        # Авторизация через куку Session_id (обходит все ограничения OAuth)
+        client = Client.from_credentials(session_id)
         client.init()
         
         await callback.message.edit_text("📥 Загружаю плейлист «Мне нравится»...")
@@ -138,13 +133,13 @@ async def start_search(callback: CallbackQuery):
     except Exception as e:
         err_msg = traceback.format_exc()
         logging.error(f"DETAILED ERROR:\n{err_msg}")
-        await callback.message.answer(f"❌ Ошибка доступа к API: {str(e)}\n\nУбедись, что в настройках приложения на oauth.yandex.ru включен доступ к Яндекс Музыке.")
+        await callback.message.answer(f"❌ Ошибка авторизации по куке: {str(e)}\n\nУбедись, что скопировала значение именно куки `Session_id` из браузера.")
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     
     logging.info("🤖 Запуск веб-сервера и бота...")
-    await asyncio.gather(
+    async asyncio.gather(
         start_web_server(),
         dp.start_polling(bot, polling_timeout=30)
     )
