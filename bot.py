@@ -31,7 +31,10 @@ async def start_web_server():
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    auth_url = "https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd491ba4b8ec639eb437c5"
+    # Безопасная сборка ссылки с твоим новым client_id
+    part1 = "https://oauth.yandex.ru/authorize?"
+    part2 = "response_type=token&client_id=5d06863a18e841a98d408686fed9ab85"
+    auth_url = part1 + part2
     
     # Создаем удобную кликабельную кнопку для авторизации
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
