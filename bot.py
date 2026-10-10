@@ -8,7 +8,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.filters import CommandStart
 from yandex_music import Client
 
-BOT_TOKEN = "8685013659:AAErk618IFRBUROGOzP8jKJzJs9A2rp2AH8"
+BOT_TOKEN = os.environ["BOT_TOKEN"]
 
 # Сюда можно временно вписать токен для проверки (или отправлять боту текстом)
 TEST_TOKEN = ""
