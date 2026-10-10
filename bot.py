@@ -29,44 +29,44 @@ async def start_web_server():
     logging.info(f"Web server successfully started on port {port}")
 # ------------------------------
 
-def get_start_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎵 Найти удаленные треки", callback_data="start_search")]
-    ])
-
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    # Безопасная сборка ссылки без возможности переноса строк
-    part1 = "https://oauth.yandex.ru/authorize?"
-    part2 = "response_type=token&client_id=23cabbbdc6cd491ba4b8ec639eb437c5"
-    auth_url = part1 + part2
+    auth_url = "https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd491ba4b8ec639eb437c5"
+    
+    # Создаем удобную кликабельную кнопку для авторизации
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔐 Авторизоваться в Яндекс Музыке", url=auth_url)]
+    ])
     
     text = (
         "Привет! Я бот для быстрого поиска удаленных треков из Яндекс Музыки.\n\n"
-        "Чтобы я мог проверить твои лайкнутые треки, мне нужен **OAuth-токен** от твоего аккаунта Яндекс Музыки.\n\n"
-        "🔗 **Как его получить:**\n"
-        f"1. Перейди по этой ссылке: {auth_url}\n"
-        "2. Нажми «Разрешить».\n"
-        "3. Из адресной строки или экрана скопируй длинный токен.\n"
-        "4. Просто отправь этот токен мне ответным сообщением!"
+        "Чтобы я мог проверить твои лайкнутые треки, мне нужен **OAuth-токен** от твоего аккаунта.\n\n"
+        "👉 **Как получить токен:**\n"
+        "1. Нажми на кнопку ниже и разреши доступ.\n"
+        "2. Скопируй длинный токен из появившейся страницы.\n"
+        "3. Вернись сюда и просто отправь его мне ответным сообщением!"
     )
-    await message.answer(text, parse_mode="Markdown")
+    await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def handle_token(message: Message):
     token = message.text.strip()
     
     if len(token) < 10 or " " in token:
-        await message.answer("❌ Это не похоже на токен. Пожалуйста, отправь токен, полученный по ссылке из команды /start.")
+        await message.answer("❌ Это не похоже на токен. Пожалуйста, отправь токен, полученный после авторизации.")
         return
 
     user_id = message.from_user.id
     with open(f"token_{user_id}.txt", "w") as f:
         f.write(token)
         
+    search_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎵 Найти удаленные треки", callback_data="start_search")]
+    ])
+    
     await message.answer(
         "✅ Токен успешно принят!\n\nНажми кнопку ниже, чтобы я проверил твой плейлист «Мне нравится».",
-        reply_markup=get_start_keyboard()
+        reply_markup=search_keyboard
     )
 
 @dp.callback_query(F.data == "start_search")
