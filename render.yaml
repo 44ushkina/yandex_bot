@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: yandex-music-bot
+    env: python
+    buildCommand: "apt-get update && apt-get install -y ffmpeg && pip install -r requirements.txt"
+    startCommand: "python bot.py"
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: YANDEX_TOKEN
+        sync: false
