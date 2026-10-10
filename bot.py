@@ -10,6 +10,9 @@ from yandex_music import Client
 
 BOT_TOKEN = "8685013659:AAErk618IFRBUROGOzP8jKJzJs9A2rp2AH8"
 
+# Сюда можно временно вписать токен для проверки (или отправлять боту текстом)
+TEST_TOKEN = ""
+
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -32,35 +35,34 @@ async def start_web_server():
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
+    # Используем официальную ссылку получения токена через Яндекс.Паспорт
+    auth_url = "https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd491ba4b8ec639eb437c5"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔐 Получить OAuth-токен", url=auth_url)],
+        [InlineKeyboardButton(text="🎵 Запустить поиск (если токен уже есть)", callback_data="start_search")]
+    ])
+    
     text = (
         "Привет! Я бот для поиска удаленных треков из Яндекс Музыки.\n\n"
-        "Поскольку Яндекс заблокировал сторонние OAuth-приложения, мы используем надежный вход по куке сессии.\n\n"
-        "👉 **Как получить куку Session_id:**\n"
-        "1. Открой music.yandex.ru в браузере (ты должна быть авторизована).\n"
-        "2. Нажми `F12` -> вкладка **Application** (Приложение) -> **Cookies** -> `https://yandex.ru`.\n"
-        "3. Найди параметр **Session_id** и скопируй его значение.\n"
-        "4. Отправь скопированное значение мне ответным сообщением!"
+        "Отправь мне свой OAuth-токен ответным сообщением, либо нажми кнопку ниже, если токен уже сохранен."
     )
-    await message.answer(text, parse_mode="Markdown", disable_web_page_preview=True)
+    await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def handle_token(message: Message):
-    cookie_value = message.text.strip()
+    token = message.text.strip()
     
-    if len(cookie_value) < 15 or " " in cookie_value:
-        await message.answer("❌ Это не похоже на Session_id. Пожалуйста, скопируй точное значение куки из браузера.")
-        return
-
     user_id = message.from_user.id
     with open(f"token_{user_id}.txt", "w") as f:
-        f.write(cookie_value)
+        f.write(token)
         
     search_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎵 Найти удаленные треки", callback_data="start_search")]
     ])
     
     await message.answer(
-        "✅ Кука успешно принята!\n\nНажми кнопку ниже, чтобы запустить проверку плейлиста.",
+        "✅ Токен сохранен!\n\nНажми кнопку ниже, чтобы запустить проверку плейлиста.",
         reply_markup=search_keyboard
     )
 
@@ -69,18 +71,23 @@ async def start_search(callback: CallbackQuery):
     user_id = callback.from_user.id
     token_file = f"token_{user_id}.txt"
     
-    if not os.path.exists(token_file):
-        await callback.message.answer("⚠️ Сначала отправь мне свою куку Session_id!")
+    # Берем токен из файла или из переменной TEST_TOKEN если файл пуст
+    token = ""
+    if os.path.exists(token_file):
+        with open(token_file, "r") as f:
+            token = f.read().strip()
+            
+    if not token and TEST_TOKEN:
+        token = TEST_TOKEN
+
+    if not token:
+        await callback.message.answer("⚠️ Сначала отправь мне свой OAuth-токен в чат!")
         return
         
-    with open(token_file, "r") as f:
-        session_id = f.read().strip()
-        
-    await callback.message.edit_text("⏳ Подключаюсь к аккаунту Яндекс Музыки через сессию...")
+    await callback.message.edit_text("⏳ Подключаюсь к аккаунту Яндекс Музыки...")
     
     try:
-        # Передаем Session_id напрямую в клиент
-        client = Client(session_id)
+        client = Client(token)
         client.init()
         
         await callback.message.edit_text("📥 Загружаю плейлист «Мне нравится»...")
@@ -133,7 +140,7 @@ async def start_search(callback: CallbackQuery):
     except Exception as e:
         err_msg = traceback.format_exc()
         logging.error(f"DETAILED ERROR:\n{err_msg}")
-        await callback.message.answer(f"❌ Ошибка авторизации: {str(e)}")
+        await callback.message.answer(f"❌ Ошибка: {str(e)}")
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
