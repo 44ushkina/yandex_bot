@@ -1,4 +1,4 @@
 aiogram>=3.0.0
 yandex-music>=2.2.6
 aiohttp
-yt-dlp
+yt-dlp[default]
