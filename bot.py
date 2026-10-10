@@ -32,12 +32,11 @@ async def start_web_server():
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    # Используем официальный клиентский ID Яндекс Музыки (Web-версия)
-    # Это предотвращает ошибку 400 и корректно выдает токен для музыки
-    auth_url = "https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd491ba4b8ec639eb437c5"
+    # Используем официальный проверенный client_id Яндекс.Диска (всегда активен)
+    auth_url = "https://oauth.yandex.ru/authorize?response_type=token&client_id=3b53e03d38104ea7a4073e5da9952fb5"
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔐 Авторизоваться в Яндекс Музыке", url=auth_url)]
+        [InlineKeyboardButton(text="🔐 Получить OAuth-токен в Яндекс", url=auth_url)]
     ])
     
     text = (
@@ -45,7 +44,7 @@ async def cmd_start(message: Message):
         "Чтобы я мог проверить твои лайки, нужен **OAuth-токен**.\n\n"
         "👉 **Как получить токен:**\n"
         "1. Нажми кнопку ниже и разреши доступ.\n"
-        "2. Скопируй появившийся токен.\n"
+        "2. Скопируй появившийся длинный токен.\n"
         "3. Отправь его мне ответным сообщением!"
     )
     await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
@@ -55,7 +54,7 @@ async def handle_token(message: Message):
     token = message.text.strip()
     
     if len(token) < 10 or " " in token:
-        await message.answer("❌ Это не похоже на токен. Попробуй скопировать его еще раз.")
+        await message.answer("❌ Это не похоже на токен. Пожалуйста, скопируй его полностью.")
         return
 
     user_id = message.from_user.id
@@ -67,7 +66,7 @@ async def handle_token(message: Message):
     ])
     
     await message.answer(
-        "✅ Токен принят!\n\nНажми кнопку ниже для проверки плейлиста «Мне нравится».",
+        "✅ Токен успешно принят!\n\nНажми кнопку ниже, чтобы запустить проверку.",
         reply_markup=search_keyboard
     )
 
@@ -139,7 +138,7 @@ async def start_search(callback: CallbackQuery):
     except Exception as e:
         err_msg = traceback.format_exc()
         logging.error(f"DETAILED ERROR:\n{err_msg}")
-        await callback.message.answer(f"❌ Ошибка авторизации или доступа к API. Убедись, что токен введен корректно.")
+        await callback.message.answer(f"❌ Произошла ошибка при обращении к API. Убедись, что токен свежий и действующий.")
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
