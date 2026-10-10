@@ -23,7 +23,13 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Не задан BOT_TOKEN в Environment на Render")
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+
+# Диагностика: библиотека будет сообщать в Render Logs о новых полях API.
+logging.getLogger("yandex_music").setLevel(logging.INFO)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -33,6 +39,19 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 auth_in_progress = set()
 search_in_progress = set()
+
+
+def make_yandex_client(token=None):
+    """Создаёт клиент с диагностикой неизвестных полей API, если версия поддерживает её."""
+    try:
+        return Client(token, report_unknown_fields=True)
+    except TypeError:
+        # Совместимость со старой версией yandex-music.
+        logging.warning(
+            "Установленная версия yandex-music не поддерживает "
+            "report_unknown_fields; диагностика неизвестных полей отключена."
+        )
+        return Client(token)
 
 
 def token_path(user_id):
@@ -126,10 +145,10 @@ async def auth_yandex(callback: CallbackQuery):
         future.result(timeout=20)
 
     def authenticate():
-        client = Client()
+        client = make_yandex_client()
         token = client.device_auth(on_code=on_code)
 
-        client = Client(token.access_token)
+        client = make_yandex_client(token.access_token)
         client.init()
 
         return token.access_token
@@ -214,7 +233,7 @@ def format_track(track, track_id):
 
 
 def check_tracks(access_token):
-    client = Client(access_token)
+    client = make_yandex_client(access_token)
     client.init()
 
     likes = client.users_likes_tracks()
