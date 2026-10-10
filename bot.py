@@ -33,7 +33,7 @@ async def start_web_server():
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     part1 = "https://oauth.yandex.ru/authorize?"
-    part2 = "response_type=token&client_id=5d06863a18e841a98d408686fed9ab85"
+    part2 = "response_type=token&client_id=f4f966491ba6452180ecce48094ebe6b"
     auth_url = part1 + part2
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -86,7 +86,6 @@ async def start_search(callback: CallbackQuery):
     await callback.message.edit_text("⏳ Подключаюсь к аккаунту Яндекс Музыки...")
     
     try:
-        # Инициализация с выводом полной ошибки в логи Render, если что-то пойдет не так
         client = Client(token)
         client.init()
         
@@ -138,10 +137,8 @@ async def start_search(callback: CallbackQuery):
         os.remove(filename)
         
     except Exception as e:
-        # Выводим полный текст ошибки в логи Render для диагностики
         err_msg = traceback.format_exc()
         logging.error(f"DETAILED ERROR:\n{err_msg}")
-        
         await callback.message.answer(f"❌ Произошла ошибка: {str(e)}\n\nВозможно, токен недействителен или устарел.")
 
 async def main():
