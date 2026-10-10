@@ -32,22 +32,21 @@ async def start_web_server():
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    # Используем доверенный Client ID Яндекс.Диска для мобильных устройств
-    part1 = "https://oauth.yandex.ru/authorize?"
-    part2 = "response_type=token&client_id=3b53e03d38104ea7a4073e5da9952fb5"
-    auth_url = part1 + part2
+    # Используем официальный клиентский ID Яндекс Музыки (Web-версия)
+    # Это предотвращает ошибку 400 и корректно выдает токен для музыки
+    auth_url = "https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd491ba4b8ec639eb437c5"
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔐 Авторизоваться в Яндекс Музыке", url=auth_url)]
     ])
     
     text = (
-        "Привет! Я бот для быстрого поиска удаленных треков из Яндекс Музыки.\n\n"
-        "Чтобы я мог проверить твои лайкнутые треки, мне нужен **OAuth-токен** от твоего аккаунта.\n\n"
+        "Привет! Я бот для поиска удаленных треков из Яндекс Музыки.\n\n"
+        "Чтобы я мог проверить твои лайки, нужен **OAuth-токен**.\n\n"
         "👉 **Как получить токен:**\n"
-        "1. Нажми на кнопку ниже и разреши доступ.\n"
-        "2. Скопируй длинный токен из появившейся страницы.\n"
-        "3. Вернись сюда и просто отправь его мне ответным сообщением!"
+        "1. Нажми кнопку ниже и разреши доступ.\n"
+        "2. Скопируй появившийся токен.\n"
+        "3. Отправь его мне ответным сообщением!"
     )
     await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
 
@@ -56,7 +55,7 @@ async def handle_token(message: Message):
     token = message.text.strip()
     
     if len(token) < 10 or " " in token:
-        await message.answer("❌ Это не похоже на токен. Пожалуйста, отправь токен, полученный после авторизации.")
+        await message.answer("❌ Это не похоже на токен. Попробуй скопировать его еще раз.")
         return
 
     user_id = message.from_user.id
@@ -68,7 +67,7 @@ async def handle_token(message: Message):
     ])
     
     await message.answer(
-        "✅ Токен успешно принят!\n\nНажми кнопку ниже, чтобы я проверил твой плейлист «Мне нравится».",
+        "✅ Токен принят!\n\nНажми кнопку ниже для проверки плейлиста «Мне нравится».",
         reply_markup=search_keyboard
     )
 
@@ -100,10 +99,10 @@ async def start_search(callback: CallbackQuery):
             track_ids = [str(t.id) for t in liked_tracks.tracks] if liked_tracks and hasattr(liked_tracks, 'tracks') else []
 
         if not track_ids:
-            await callback.message.edit_text("❌ Не удалось найти треки в плейлисте «Мне нравится». Возможно, плейлист пуст.")
+            await callback.message.edit_text("❌ В твоем плейлисте «Мне нравится» не найдено треков.")
             return
 
-        await callback.message.edit_text(f"🔍 Найдено {len(track_ids)} треков в лайках. Сверяю статус с серверами...")
+        await callback.message.edit_text(f"🔍 Проверяю статус {len(track_ids)} треков...")
 
         deleted_tracks = []
         batch_size = 100
@@ -122,7 +121,7 @@ async def start_search(callback: CallbackQuery):
 
         filename = f"deleted_{user_id}.txt"
         with open(filename, "w", encoding="utf-8") as f:
-            f.write("=== ТВОИ УДАЛЕННЫЕ ТРЕКИ ИЗ ЯНДЕКС МУЗЫКИ ===\n\n")
+            f.write("=== УДАЛЕННЫЕ ТРЕКИ ИЗ ЯНДЕКС МУЗЫКИ ===\n\n")
             if deleted_tracks:
                 for t in deleted_tracks:
                     f.write(f"{t}\n")
@@ -140,7 +139,7 @@ async def start_search(callback: CallbackQuery):
     except Exception as e:
         err_msg = traceback.format_exc()
         logging.error(f"DETAILED ERROR:\n{err_msg}")
-        await callback.message.answer(f"❌ Произошла ошибка: {str(e)}\n\nВозможно, токен недействителен или устарел.")
+        await callback.message.answer(f"❌ Ошибка авторизации или доступа к API. Убедись, что токен введен корректно.")
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
