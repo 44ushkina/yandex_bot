@@ -23,11 +23,20 @@ dp = Dispatcher()
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+# Максимально допустимая разница длительности (в секундах) между оригиналом
+# из Яндекса и найденным файлом. Чем меньше число, тем строже отбор:
+# меньше ускоренных/замедленных версий, но и меньше найденных треков.
+MAX_DURATION_DIFF = 7
+
+# Сколько треков обрабатывать в одной части, если подсказывать следующую команду
+PART_SIZE = 100
+
 # Слова, которые обычно означают "не оригинал"
 BAD_WORDS = {
-    "remix", "cover", "slowed", "reverb", "sped", "speed", "nightcore",
-    "karaoke", "instrumental", "mashup", "8d", "boosted",
+    "remix", "cover", "slowed", "reverb", "sped", "speed", "speedup", "spedup",
+    "nightcore", "karaoke", "instrumental", "mashup", "8d", "boosted",
     "ремикс", "кавер", "минус", "караоке",
+    "ускоренный", "ускоренная", "ускорено", "ускорен", "замедленный", "замедленная",
 }
 
 
@@ -100,19 +109,17 @@ def score_entry(entry, artist_words, title_words, orig_duration):
 
     score = title_part * 2 + artist_part
 
-    # штраф за ремиксы, каверы и т.п., если этого слова нет в оригинальном названии
+    # штраф за ремиксы, каверы, ускоренные версии и т.п.,
+    # если этого слова нет в оригинальном названии
     found_title_words = norm_words(found_title)
     bad = (found_title_words & BAD_WORDS) - title_words
     score -= 0.7 * len(bad)
 
-    # сравнение длительности
+    # бонус за точное совпадение длительности
     found_duration = entry.get("duration")
     if found_duration and orig_duration:
-        diff = abs(found_duration - orig_duration)
-        if diff <= 10:
+        if abs(found_duration - orig_duration) <= 3:
             score += 0.5
-        elif diff > max(30, orig_duration * 0.25):
-            score -= 1.5
 
     return score, title_part
 
@@ -134,11 +141,23 @@ def search_candidates(query, artist_words, title_words, orig_duration):
         for entry in info.get("entries") or []:
             if not entry:
                 continue
-            duration = entry.get("duration")
-            if duration and duration > 600:
+            found_duration = entry.get("duration")
+            if found_duration and found_duration > 600:
                 continue  # слишком длинное: микс, альбом целиком
+
+            # строгая проверка длительности
+            if found_duration and orig_duration:
+                diff = abs(found_duration - orig_duration)
+                if diff > MAX_DURATION_DIFF:
+                    logging.info(
+                        f"   отброшен: '{entry.get('title')}' длительность отличается на {diff:.0f} с"
+                    )
+                    continue
+
             score, title_part = score_entry(entry, artist_words, title_words, orig_duration)
-            logging.info(f"   кандидат: '{entry.get('title')}' оценка={score:.2f} совпадение названия={title_part:.2f}")
+            logging.info(
+                f"   кандидат: '{entry.get('title')}' оценка={score:.2f} совпадение названия={title_part:.2f}"
+            )
             if title_part >= 0.6 and score >= 2.0:
                 result.append((score, entry))
     except Exception as e:
@@ -174,7 +193,7 @@ def download_url(url):
 
 def download_track_public(artists, title, orig_duration=None):
     """Главная функция: ищет лучший вариант трека и скачивает его."""
-    logging.info(f"Ищу: {artists} — {title}")
+    logging.info(f"Ищу: {artists} — {title} (длительность {orig_duration})")
     first_artist = artists.split(",")[0].strip()
     artist_words = norm_words(artists)
     title_words = norm_words(title)
@@ -204,28 +223,56 @@ def download_track_public(artists, title, orig_duration=None):
     return None
 
 
-# ---------- общая логика переноса ----------
-async def transfer(message: Message, tracks, limit=None):
-    total_all = len(tracks)
-    if limit:
-        tracks = tracks[-limit:]
-    total = len(tracks)
+# ---------- выбор части плейлиста ----------
+def parse_selection(arg_text, total):
+    """
+    Разбирает, какие треки обрабатывать. Возвращает (начало, конец), нумерация с 1,
+    или None, если запись непонятна.
+      пусто    -> все треки
+      "5"      -> последние 5 треков списка (для проверки)
+      "1-100"  -> треки с 1-го по 100-й
+    """
+    arg_text = (arg_text or "").strip()
+    if not arg_text:
+        return 1, total
 
-    hours = round(total * 30 / 3600, 1)
+    match = re.fullmatch(r"(\d+)\s*-\s*(\d+)", arg_text)
+    if match:
+        start, end = int(match.group(1)), int(match.group(2))
+    elif arg_text.isdigit():
+        n = int(arg_text)
+        start, end = max(1, total - n + 1), total
+    else:
+        return None
+
+    end = min(end, total)
+    if start < 1 or start > end:
+        return None
+    return start, end
+
+
+# ---------- общая логика переноса ----------
+async def transfer(message: Message, all_tracks, start, end, command_name, extra_args=""):
+    total_all = len(all_tracks)
+    selected = all_tracks[start - 1:end]
+    count = len(selected)
+
+    hours = round(count * 30 / 3600, 1)
     await message.answer(
-        f"Найдено треков: {total_all}. В работе: {total}.\n"
+        f"Всего в плейлисте: {total_all}. В работе: с {start} по {end} ({count} шт.).\n"
         f"Примерное время: {hours} ч. Одно сообщение с прогрессом будет обновляться."
     )
     progress = await message.answer("Начинаю...")
 
     ok, failed = 0, []
-    for i, short_track in enumerate(tracks, 1):
+    for offset, short_track in enumerate(selected):
+        number = start + offset  # номер трека в плейлисте
         cover = None
         file_path = None
         try:
             title, artists, cover, duration = await asyncio.to_thread(yandex_track_info, short_track)
             try:
-                await progress.edit_text(f"[{i}/{total}] Ищу: {artists} — {title}")
+                await progress.edit_text(f"№{number} (до {end}): {artists} — {title}")
             except Exception:
                 pass
 
@@ -239,10 +286,10 @@ async def transfer(message: Message, tracks, limit=None):
                 )
                 ok += 1
             else:
-                failed.append(f"{artists} — {title}")
+                failed.append(f"№{number}: {artists} — {title}")
         except Exception as e:
             logging.exception("Ошибка на треке")
-            failed.append(f"трек #{i} ({e})")
+            failed.append(f"№{number}: ошибка ({e})")
         finally:
             for p in (file_path, cover):
                 if p and os.path.exists(p):
@@ -250,14 +297,20 @@ async def transfer(message: Message, tracks, limit=None):
 
         # пауза, чтобы Telegram не ограничил бота за частые отправки
         await asyncio.sleep(3)
-        if i % 5 == 0:
+        if (offset + 1) % 5 == 0:
             await asyncio.sleep(10)
 
-    report = f"Готово. Загружено: {ok} из {total}."
+    report = f"Готово: треки с {start} по {end}. Загружено: {ok} из {count}."
     if failed:
         report += "\n\nНе удалось найти:\n" + "\n".join(failed[:40])
         if len(failed) > 40:
             report += f"\n...и ещё {len(failed) - 40}"
+    if end < total_all:
+        next_start = end + 1
+        next_end = min(end + PART_SIZE, total_all)
+        report += f"\n\nСледующая часть:\n/{command_name} {extra_args}{next_start}-{next_end}".replace("  ", " ")
+    else:
+        report += "\n\nПлейлист закончился."
     await message.answer(report)
 
 
@@ -267,9 +320,11 @@ async def cmd_start(message: Message):
     await message.answer(
         "Привет! Я переношу треки из Яндекс Музыки в Telegram.\n\n"
         "/download — весь плейлист «Мне нравится»\n"
-        "/download 3 — только последние 3 трека (для проверки)\n"
-        "/playlist логин номер — публичный плейлист. Ссылка вида "
-        "music.yandex.ru/users/ЛОГИН/playlists/НОМЕР"
+        "/download 3 — последние 3 трека списка (для проверки)\n"
+        "/download 1-100 — треки с 1-го по 100-й (перенос частями)\n\n"
+        "/playlist логин номер — публичный плейлист целиком\n"
+        "/playlist логин номер 1-100 — часть плейлиста\n"
+        "Ссылка плейлиста: music.yandex.ru/users/ЛОГИН/playlists/НОМЕР"
     )
 
 
@@ -279,11 +334,19 @@ async def cmd_download(message: Message):
         await message.answer("Не задан YANDEX_TOKEN в Render.")
         return
     args = message.text.split()
-    limit = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
+    arg_text = " ".join(args[1:])
     try:
         await message.answer("Получаю список «Мне нравится»...")
         tracks = await asyncio.to_thread(yandex_get_liked, YANDEX_TOKEN)
-        await transfer(message, tracks, limit)
+        selection = parse_selection(arg_text, len(tracks))
+        if selection is None:
+            await message.answer(
+                f"Не поняла диапазон. В плейлисте {len(tracks)} треков. "
+                "Примеры: /download 5 или /download 1-100"
+            )
+            return
+        start, end = selection
+        await transfer(message, tracks, start, end, "download")
     except Exception as e:
         await message.answer(f"Ошибка при работе с Яндекс Музыкой: {e}")
 
@@ -292,13 +355,22 @@ async def cmd_download(message: Message):
 async def cmd_playlist(message: Message):
     args = message.text.split()
     if len(args) < 3 or not args[2].isdigit():
-        await message.answer("Формат: /playlist логин номер [сколько]")
+        await message.answer("Формат: /playlist логин номер [5 или 1-100]")
         return
-    limit = int(args[3]) if len(args) > 3 and args[3].isdigit() else None
+    login, kind = args[1], args[2]
+    arg_text = " ".join(args[3:])
     try:
         await message.answer("Получаю плейлист...")
-        tracks = await asyncio.to_thread(yandex_get_playlist, YANDEX_TOKEN, args[1], args[2])
-        await transfer(message, tracks, limit)
+        tracks = await asyncio.to_thread(yandex_get_playlist, YANDEX_TOKEN, login, kind)
+        selection = parse_selection(arg_text, len(tracks))
+        if selection is None:
+            await message.answer(
+                f"Не поняла диапазон. В плейлисте {len(tracks)} треков. "
+                f"Примеры: /playlist {login} {kind} 5 или /playlist {login} {kind} 1-100"
+            )
+            return
+        start, end = selection
+        await transfer(message, tracks, start, end, "playlist", extra_args=f"{login} {kind} ")
     except Exception as e:
         await message.answer(f"Ошибка при получении плейлиста: {e}")
 
