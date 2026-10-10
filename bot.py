@@ -36,11 +36,14 @@ def get_start_keyboard():
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
+    # Ссылка записана строго в одну строку без переносов
+    auth_url = "https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd491ba4b8ec639eb437c5"
+    
     text = (
         "Привет! Я бот для быстрого поиска удаленных треков из Яндекс Музыки.\n\n"
         "Чтобы я мог проверить твои лайкнутые треки, мне нужен **OAuth-токен** от твоего аккаунта Яндекс Музыки.\n\n"
         "🔗 **Как его получить:**\n"
-        "1. Перейди по этой ссылке: https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd491ba4b8ec639eb437c5\n"
+        f"1. Перейди по этой ссылке: {auth_url}\n"
         "2. Нажми «Разрешить».\n"
         "3. Из адресной строки или экрана скопируй длинный токен.\n"
         "4. Просто отправь этот токен мне ответным сообщением!"
