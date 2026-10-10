@@ -1,6 +1,9 @@
 import os
 import asyncio
 import logging
+import urllib.request
+import urllib.parse
+import json
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, FSInputFile
@@ -35,12 +38,41 @@ async def start_web_server():
     await site.start()
     logging.info(f"Web server started and listening on port {port}")
 
-# Функция скачивания: приоритет SoundCloud для обхода блокировок хостинга
+# Функция поиска через открытые API (обход блокировок поисковых роботов на Render)
+def search_youtube_via_api(query: str):
+    instances = [
+        "https://vid.priv.au",
+        "https://invidious.privacyredirect.com",
+        "https://inv.nadeko.net"
+    ]
+    encoded_query = urllib.parse.quote(query)
+    
+    for instance in instances:
+        try:
+            url = f"{instance}/api/v1/search?q={encoded_query}&type=video"
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=4) as response:
+                data = json.loads(response.read().decode())
+                if data and isinstance(data, list) and len(data) > 0:
+                    video_id = data[0].get('videoId')
+                    if video_id:
+                        return f"https://www.youtube.com/watch?v={video_id}"
+        except Exception:
+            continue
+    return None
+
+# Функция скачивания с использованием прямой ссылки
 def download_track_from_youtube(artist: str, title: str, output_path: str = "downloads"):
     os.makedirs(output_path, exist_ok=True)
-    
     query = f"{artist} - {title}"
     
+    # Шаг 1: Получаем прямую ссылку через публичный API без блокировок
+    video_url = search_youtube_via_api(query)
+    
+    # Если через API найти не удалось, пробуем стандартный метод как запасной
+    if not video_url:
+        video_url = f"ytsearch1:{query}"
+
     ydl_opts = {
         'format': 'bestaudio/best',
         'postprocessors': [{
@@ -56,25 +88,16 @@ def download_track_from_youtube(artist: str, title: str, output_path: str = "dow
         }
     }
     
-    # Сначала ищем в SoundCloud (scsearch1), где IP хостингов не заблокированы, 
-    # а затем используем запасные варианты на YouTube
-    search_queries = [
-        f"scsearch1:{query}",
-        f"ytsearch1:{query} explicit",
-        f"ytsearch1:{query}"
-    ]
-    
-    for q in search_queries:
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(q, download=True)
-                filename = ydl.prepare_filename(info)
-                mp3_filename = os.path.splitext(filename)[0] + ".mp3"
-                if os.path.exists(mp3_filename):
-                    return mp3_filename
-        except Exception as e:
-            continue
-            
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=True)
+            filename = ydl.prepare_filename(info)
+            mp3_filename = os.path.splitext(filename)[0] + ".mp3"
+            if os.path.exists(mp3_filename):
+                return mp3_filename
+    except Exception as e:
+        logging.error(f"Ошибка скачивания {query}: {e}")
+        
     return None
 
 @dp.message(Command("start"))
