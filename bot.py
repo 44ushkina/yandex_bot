@@ -32,29 +32,43 @@ async def start_web_server():
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    # Используем официальный проверенный client_id Яндекс.Диска (всегда активен)
-    auth_url = "https://oauth.yandex.ru/authorize?response_type=token&client_id=3b53e03d38104ea7a4073e5da9952fb5"
+    # Прямая официальная ссылка на получение токена через Яндекс Паспорт (без кастомных сломанных client_id)
+    auth_url = "https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd491ba4b8ec639eb437c5"
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔐 Получить OAuth-токен в Яндекс", url=auth_url)]
+        [InlineKeyboardButton(text="🔐 Получить OAuth-токен", url=auth_url)],
+        [InlineKeyboardButton(text="ℹ️ Как получить токен вручную?", callback_data="help_token")]
     ])
     
     text = (
         "Привет! Я бот для поиска удаленных треков из Яндекс Музыки.\n\n"
-        "Чтобы я мог проверить твои лайки, нужен **OAuth-токен**.\n\n"
-        "👉 **Как получить токен:**\n"
-        "1. Нажми кнопку ниже и разреши доступ.\n"
-        "2. Скопируй появившийся длинный токен.\n"
-        "3. Отправь его мне ответным сообщением!"
+        "Чтобы я мог проверить твои лайки, мне нужен твой **OAuth-токен**.\n\n"
+        "👉 **Как получить:**\n"
+        "1. Нажми кнопку ниже.\n"
+        "2. Скопируй выданный токен (начинается с `y0_`).\n"
+        "3. Отправь его мне сюда ответным сообщением!"
     )
     await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
+
+@dp.callback_query(F.data == "help_token")
+async def help_token(callback: CallbackQuery):
+    await callback.message.answer(
+        "💡 **Инструкция по получению токена:**\n\n"
+        "Если кнопка авторизации вызывает ошибку:\n"
+        "1. Открой в браузере сайт Яндекс Музыки и убедись, что ты вошел в аккаунт.\n"
+        "2. Перейди по ссылке: `https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd491ba4b8ec639eb437c5`\n"
+        "3. Разреши доступ и скопируй длинную строчку символов из адресной строки или страницы.\n"
+        "4. Вернись в чат со мной и отправь этот токен.",
+        parse_mode="Markdown"
+    )
+    await callback.answer()
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def handle_token(message: Message):
     token = message.text.strip()
     
     if len(token) < 10 or " " in token:
-        await message.answer("❌ Это не похоже на токен. Пожалуйста, скопируй его полностью.")
+        await message.answer("❌ Это не похоже на токен. Пожалуйста, отправь токен, начинающийся с `y0_`.")
         return
 
     user_id = message.from_user.id
@@ -66,7 +80,7 @@ async def handle_token(message: Message):
     ])
     
     await message.answer(
-        "✅ Токен успешно принят!\n\nНажми кнопку ниже, чтобы запустить проверку.",
+        "✅ Токен успешно принят!\n\nНажми кнопку ниже, чтобы запустить проверку плейлиста.",
         reply_markup=search_keyboard
     )
 
@@ -138,9 +152,10 @@ async def start_search(callback: CallbackQuery):
     except Exception as e:
         err_msg = traceback.format_exc()
         logging.error(f"DETAILED ERROR:\n{err_msg}")
-        await callback.message.answer(f"❌ Произошла ошибка при обращении к API. Убедись, что токен свежий и действующий.")
+        await callback.message.answer("❌ Ошибка авторизации. Убедись, что токен скопирован правильно и полностью.")
 
 async def main():
+    # Сбрасываем вебхук и старые соединения, чтобы избежать конфликтов
     await bot.delete_webhook(drop_pending_updates=True)
     
     logging.info("🤖 Запуск веб-сервера и бота...")
