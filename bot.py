@@ -36,7 +36,7 @@ async def cmd_start(message: Message):
         "Привет! Я бот для поиска удаленных треков из Яндекс Музыки.\n\n"
         "Поскольку Яндекс заблокировал сторонние OAuth-приложения, мы используем надежный вход по куке сессии.\n\n"
         "👉 **Как получить куку Session_id:**\n"
-        "1. Открой [music.yandex.ru](https://music.yandex.ru/) в браузере (ты должна быть авторизована).\n"
+        "1. Открой music.yandex.ru в браузере (ты должна быть авторизована).\n"
         "2. Нажми `F12` -> вкладка **Application** (Приложение) -> **Cookies** -> `https://yandex.ru`.\n"
         "3. Найди параметр **Session_id** и скопируй его значение.\n"
         "4. Отправь скопированное значение мне ответным сообщением!"
@@ -79,7 +79,8 @@ async def start_search(callback: CallbackQuery):
     await callback.message.edit_text("⏳ Подключаюсь к аккаунту Яндекс Музыки через сессию...")
     
     try:
-        client = Client.from_credentials(session_id)
+        # Передаем Session_id напрямую в клиент
+        client = Client(session_id)
         client.init()
         
         await callback.message.edit_text("📥 Загружаю плейлист «Мне нравится»...")
@@ -132,13 +133,12 @@ async def start_search(callback: CallbackQuery):
     except Exception as e:
         err_msg = traceback.format_exc()
         logging.error(f"DETAILED ERROR:\n{err_msg}")
-        await callback.message.answer(f"❌ Ошибка авторизации по куке: {str(e)}\n\nУбедись, что скопировала значение именно куки `Session_id` из браузера.")
+        await callback.message.answer(f"❌ Ошибка авторизации: {str(e)}")
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     
     logging.info("🤖 Запуск веб-сервера и бота...")
-    # Исправлен синтаксис вызова
     await asyncio.gather(
         start_web_server(),
         dp.start_polling(bot, polling_timeout=30)
