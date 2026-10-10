@@ -31,12 +31,10 @@ async def start_web_server():
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    # Безопасная сборка ссылки с твоим новым client_id
     part1 = "https://oauth.yandex.ru/authorize?"
     part2 = "response_type=token&client_id=5d06863a18e841a98d408686fed9ab85"
     auth_url = part1 + part2
     
-    # Создаем удобную кликабельную кнопку для авторизации
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔐 Авторизоваться в Яндекс Музыке", url=auth_url)]
     ])
@@ -87,22 +85,21 @@ async def start_search(callback: CallbackQuery):
     await callback.message.edit_text("⏳ Подключаюсь к аккаунту Яндекс Музыки...")
     
     try:
-        client = Client(token).init()
+        # Надежная инициализация клиента
+        client = Client(token)
+        client.init()
         
         await callback.message.edit_text("📥 Загружаю плейлист «Мне нравится»...")
         
         likes = client.users_likes_tracks()
         track_ids = [str(track.id) for track in likes.tracks] if likes and hasattr(likes, 'tracks') else []
         
-        if not track_ids:
-            try:
-                liked_tracks = client.users_likes_tracks(client.user.uid)
-                track_ids = [str(t.id) for t in liked_tracks.tracks]
-            except Exception:
-                pass
+        if not track_ids and client.me:
+            liked_tracks = client.users_likes_tracks(client.me.account.uid)
+            track_ids = [str(t.id) for t in liked_tracks.tracks] if liked_tracks and hasattr(liked_tracks, 'tracks') else []
 
         if not track_ids:
-            await callback.message.edit_text("❌ Не удалось найти треки в «Мне нравится» или токен недействителен.")
+            await callback.message.edit_text("❌ Не удалось найти треки в плейлисте «Мне нравится». Возможно, плейлист пуст.")
             return
 
         await callback.message.edit_text(f"🔍 Найдено {len(track_ids)} треков в лайках. Сверяю статус с серверами...")
@@ -115,7 +112,7 @@ async def start_search(callback: CallbackQuery):
             tracks_info = client.tracks(batch)
             
             for item in tracks_info:
-                if not item.available:
+                if item and not item.available:
                     artists_names = ", ".join([a.name for a in item.artists]) if item.artists else "Неизвестный исполнитель"
                     title = item.title
                     if item.version:
