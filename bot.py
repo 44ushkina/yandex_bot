@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import logging
 
@@ -21,6 +22,13 @@ dp = Dispatcher()
 
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+# Слова, которые обычно означают "не оригинал"
+BAD_WORDS = {
+    "remix", "cover", "slowed", "reverb", "sped", "speed", "nightcore",
+    "karaoke", "instrumental", "mashup", "8d", "boosted",
+    "ремикс", "кавер", "минус", "караоке",
+}
 
 
 # ---------- веб-сервер, чтобы Render видел открытый порт ----------
@@ -51,23 +59,97 @@ def yandex_get_playlist(token, user_login, kind):
 
 
 def yandex_track_info(short_track):
-    """Возвращает (название, артисты, путь к обложке или None)."""
+    """Возвращает (название, артисты, путь к обложке или None, длительность в секундах или None)."""
     track = short_track.fetch_track()
     title = track.title
     artists = ", ".join(a.name for a in track.artists)
+    duration = None
+    if track.duration_ms:
+        duration = track.duration_ms / 1000
     cover_path = None
     try:
         cover_path = os.path.join(DOWNLOAD_DIR, f"cover_{track.id}.jpg")
         track.download_cover(cover_path, size="200x200")
     except Exception:
         cover_path = None
-    return title, artists, cover_path
+    return title, artists, cover_path, duration
 
 
-# ---------- поиск и скачивание аудио ----------
-def download_track_public(artist, title):
-    clean_query = f"{artist} - {title}".replace('"', "").replace("'", "")
-    base_opts = {
+# ---------- умный поиск аудио ----------
+def norm_words(text):
+    """Разбивает текст на множество слов (маленькими буквами, без знаков)."""
+    if not text:
+        return set()
+    return set(re.sub(r"[^\w\s]", " ", text.lower()).split())
+
+
+def score_entry(entry, artist_words, title_words, orig_duration):
+    """Оценка того, насколько найденный результат похож на нужный трек."""
+    found_title = entry.get("title") or ""
+    uploader = entry.get("uploader") or entry.get("channel") or ""
+    found_words = norm_words(found_title + " " + uploader)
+
+    if title_words:
+        title_part = len(title_words & found_words) / len(title_words)
+    else:
+        title_part = 0.0
+    if artist_words:
+        artist_part = len(artist_words & found_words) / len(artist_words)
+    else:
+        artist_part = 0.0
+
+    score = title_part * 2 + artist_part
+
+    # штраф за ремиксы, каверы и т.п., если этого слова нет в оригинальном названии
+    found_title_words = norm_words(found_title)
+    bad = (found_title_words & BAD_WORDS) - title_words
+    score -= 0.7 * len(bad)
+
+    # сравнение длительности
+    found_duration = entry.get("duration")
+    if found_duration and orig_duration:
+        diff = abs(found_duration - orig_duration)
+        if diff <= 10:
+            score += 0.5
+        elif diff > max(30, orig_duration * 0.25):
+            score -= 1.5
+
+    return score, title_part
+
+
+def search_candidates(query, artist_words, title_words, orig_duration):
+    """Ищет по запросу и возвращает список (оценка, результат), лучшие первыми."""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "ignoreerrors": True,
+        "skip_download": True,
+    }
+    result = []
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(query, download=False)
+        if not info:
+            return result
+        for entry in info.get("entries") or []:
+            if not entry:
+                continue
+            duration = entry.get("duration")
+            if duration and duration > 600:
+                continue  # слишком длинное: микс, альбом целиком
+            score, title_part = score_entry(entry, artist_words, title_words, orig_duration)
+            logging.info(f"   кандидат: '{entry.get('title')}' оценка={score:.2f} совпадение названия={title_part:.2f}")
+            if title_part >= 0.6 and score >= 2.0:
+                result.append((score, entry))
+    except Exception as e:
+        logging.warning(f"Ошибка поиска '{query}': {e}")
+    result.sort(key=lambda x: x[0], reverse=True)
+    return result
+
+
+def download_url(url):
+    """Скачивает конкретную ссылку и возвращает путь к mp3 или None."""
+    opts = {
         "format": "bestaudio/best",
         "postprocessors": [
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
@@ -75,33 +157,50 @@ def download_track_public(artist, title):
         "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
-        "ignoreerrors": True,
         "noplaylist": True,
-        # пропускаем слишком длинные видео (миксы, альбомы целиком)
-        "match_filter": yt_dlp.utils.match_filter_func("duration < 600"),
     }
-    queries = [
-        f"scsearch1:{clean_query}",
-        f"ytsearch1:{clean_query} audio",
-        f"ytsearch1:{clean_query}",
-    ]
-    for q in queries:
-        try:
-            with yt_dlp.YoutubeDL(base_opts) as ydl:
-                info = ydl.extract_info(q, download=True)
-                if not info:
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if not info:
+                return None
+            mp3 = os.path.splitext(ydl.prepare_filename(info))[0] + ".mp3"
+            if os.path.exists(mp3):
+                return mp3
+    except Exception as e:
+        logging.warning(f"Ошибка скачивания {url}: {e}")
+    return None
+
+
+def download_track_public(artists, title, orig_duration=None):
+    """Главная функция: ищет лучший вариант трека и скачивает его."""
+    logging.info(f"Ищу: {artists} — {title}")
+    first_artist = artists.split(",")[0].strip()
+    artist_words = norm_words(artists)
+    title_words = norm_words(title)
+
+    # варианты запроса: от самого точного к более простым
+    query_texts = [f"{artists} - {title}"]
+    if first_artist and first_artist != artists:
+        query_texts.append(f"{first_artist} - {title}")
+    query_texts.append(f"{title} {first_artist}")
+
+    sources = ["scsearch5", "ytsearch5"]
+
+    for source in sources:
+        for text in query_texts:
+            query = f"{source}:{text}"
+            logging.info(f"Запрос: {query}")
+            candidates = search_candidates(query, artist_words, title_words, orig_duration)
+            # пробуем скачать до 3 лучших результатов
+            for score, entry in candidates[:3]:
+                url = entry.get("webpage_url") or entry.get("url")
+                if not url:
                     continue
-                if "entries" in info:
-                    entries = [e for e in info["entries"] if e]
-                    if not entries:
-                        continue
-                    info = entries[0]
-                mp3 = os.path.splitext(ydl.prepare_filename(info))[0] + ".mp3"
-                if os.path.exists(mp3):
-                    return mp3
-        except Exception as e:
-            logging.warning(f"Ошибка поиска '{q}': {e}")
-            continue
+                logging.info(f"Выбран: '{entry.get('title')}' (оценка {score:.2f})")
+                path = download_url(url)
+                if path:
+                    return path
     return None
 
 
@@ -112,7 +211,7 @@ async def transfer(message: Message, tracks, limit=None):
         tracks = tracks[-limit:]
     total = len(tracks)
 
-    hours = round(total * 20 / 3600, 1)
+    hours = round(total * 30 / 3600, 1)
     await message.answer(
         f"Найдено треков: {total_all}. В работе: {total}.\n"
         f"Примерное время: {hours} ч. Одно сообщение с прогрессом будет обновляться."
@@ -124,13 +223,13 @@ async def transfer(message: Message, tracks, limit=None):
         cover = None
         file_path = None
         try:
-            title, artists, cover = await asyncio.to_thread(yandex_track_info, short_track)
+            title, artists, cover, duration = await asyncio.to_thread(yandex_track_info, short_track)
             try:
                 await progress.edit_text(f"[{i}/{total}] Ищу: {artists} — {title}")
             except Exception:
                 pass
 
-            file_path = await asyncio.to_thread(download_track_public, artists, title)
+            file_path = await asyncio.to_thread(download_track_public, artists, title, duration)
             if file_path:
                 await message.answer_audio(
                     audio=FSInputFile(file_path),
