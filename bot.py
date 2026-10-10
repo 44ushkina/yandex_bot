@@ -38,12 +38,40 @@ async def start_web_server():
     await site.start()
     logging.info(f"Web server started and listening on port {port}")
 
-# Устойчивая функция поиска и скачивания через оптимизированный профиль yt-dlp
+# Безопасный поиск через открытые API инстансы
+def search_youtube_via_api(query: str):
+    instances = [
+        "https://vid.priv.au",
+        "https://invidious.privacyredirect.com",
+        "https://inv.nadeko.net"
+    ]
+    encoded_query = urllib.parse.quote(query)
+    
+    for instance in instances:
+        try:
+            url = f"{instance}/api/v1/search?q={encoded_query}&type=video"
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=3) as response:
+                data = json.loads(response.read().decode())
+                if data and isinstance(data, list) and len(data) > 0:
+                    video_id = data[0].get('videoId')
+                    if video_id:
+                        return f"https://www.youtube.com/watch?v={video_id}"
+        except Exception:
+            continue
+    return None
+
+# Функция скачивания с защитой от None и эмуляцией Android/TV клиента
 def download_track_clean(artist: str, title: str, output_path: str = "downloads"):
     os.makedirs(output_path, exist_ok=True)
     clean_query = f"{artist} - {title}".replace('"', '').replace("'", "")
     
-    # Настройки yt-dlp с минимальным набором параметров, чтобы избежать конфликтов плееров
+    # Сначала ищем через Invidious API
+    video_url = search_youtube_via_api(clean_query)
+    if not video_url:
+        video_url = f"ytsearch1:{clean_query}"
+
+    # Используем клиенты android/tv для обхода блокировок плеера на хостингах
     ydl_opts = {
         'format': 'bestaudio/best',
         'postprocessors': [{
@@ -54,39 +82,30 @@ def download_track_clean(artist: str, title: str, output_path: str = "downloads"
         'outtmpl': os.path.join(output_path, '%(id)s.%(ext)s'),
         'quiet': True,
         'no_warnings': True,
-        # Отключаем лишние проверки и используем обходные эмуляторы
+        'extractor_args': {'youtube': {'player_client': ['android', 'tv']}},
         'ignoreerrors': True,
-        'geo_bypass': True,
     }
     
-    # Пробуем последовательно разные поисковые префиксы без сложных заголовков
-    queries = [
-        f"ytsearch1:{clean_query} audio",
-        f"scsearch1:{clean_query}",
-        f"ytsearch1:{clean_query}"
-    ]
-    
-    for q in queries:
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(q, download=True)
-                if not info:
-                    continue
-                # Если это результативный плейлист/поиск, берем первый элемент
-                if 'entries' in info:
-                    entries = list(info['entries'])
-                    if not entries:
-                        continue
-                    info = entries[0]
-                
-                filename = ydl.prepare_filename(info)
-                mp3_filename = os.path.splitext(filename)[0] + ".mp3"
-                if os.path.exists(mp3_filename):
-                    return mp3_filename
-        except Exception as e:
-            logging.warning(f"Попытка поиска по запросу '{q}' не удалась: {e}")
-            continue
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=True)
+            if not info:
+                return None
             
+            # Если это плейлист/результат поиска, берем первый элемент
+            if 'entries' in info:
+                entries = list(info['entries'])
+                if not entries or entries[0] is None:
+                    return None
+                info = entries[0]
+            
+            filename = ydl.prepare_filename(info)
+            mp3_filename = os.path.splitext(filename)[0] + ".mp3"
+            if os.path.exists(mp3_filename):
+                return mp3_filename
+    except Exception as e:
+        logging.warning(f"Ошибка скачивания '{clean_query}': {e}")
+        
     return None
 
 @dp.message(Command("start"))
