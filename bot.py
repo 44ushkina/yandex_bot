@@ -30,16 +30,16 @@ async def start_web_server():
     app.router.add_get("/", handle_ping)
     runner = web.AppRunner(app)
     await runner.setup()
-    # Render передает порт через переменные окружения, по умолчанию ставим 10000
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     logging.info(f"Web server started on port {port}")
 
-# Функция скачивания трека через yt-dlp
+# Улучшенная функция скачивания через yt-dlp с обходом ограничений IP
 def download_track_from_youtube(artist: str, title: str, output_path: str = "downloads"):
     os.makedirs(output_path, exist_ok=True)
-    query = f"ytsearch1:{artist} - {title} official audio"
+    
+    query = f"{artist} - {title}"
     
     ydl_opts = {
         'format': 'bestaudio/best',
@@ -50,18 +50,30 @@ def download_track_from_youtube(artist: str, title: str, output_path: str = "dow
         }],
         'outtmpl': os.path.join(output_path, '%(id)s.%(ext)s'),
         'quiet': True,
-        'no_warnings': True
+        'no_warnings': True,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
     }
     
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(query, download=True)
-            filename = ydl.prepare_filename(info)
-            mp3_filename = os.path.splitext(filename)[0] + ".mp3"
-            if os.path.exists(mp3_filename):
-                return mp3_filename
-    except Exception as e:
-        logging.error(f"Ошибка при скачивании через yt-dlp ({artist} - {title}): {e}")
+    # Несколько вариантов запроса на случай, если первый не сработает
+    search_queries = [
+        f"ytsearch1:{query} official audio",
+        f"ytsearch1:{query}",
+        f"ytsearch1:{artist} track"
+    ]
+    
+    for q in search_queries:
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(q, download=True)
+                filename = ydl.prepare_filename(info)
+                mp3_filename = os.path.splitext(filename)[0] + ".mp3"
+                if os.path.exists(mp3_filename):
+                    return mp3_filename
+        except Exception as e:
+            continue
+            
     return None
 
 @dp.message(Command("start"))
@@ -69,7 +81,7 @@ async def cmd_start(message: Message):
     await message.answer(
         "Привет! Я бот для переноса треков из Яндекс Музыки в Telegram без цензуры.\n\n"
         "📌 **Как пользоваться:**\n"
-        "Отправь команду `/download` или укажи количество треков с конца, например: `/download 3` (для теста)."
+        "Отправь команду `/download` для полного переноса или укажи количество треков с конца, например: `/download 1` (для быстрой проверки)."
     )
 
 @dp.message(Command("download"))
@@ -143,7 +155,6 @@ async def cmd_download(message: Message):
         await message.answer(f"❌ Произошла ошибка при работе с Яндекс Музыкой: {e}")
 
 async def main():
-    # Запускаем веб-сервер для Render и поллинг бота одновременно
     await start_web_server()
     await dp.start_polling(bot)
 
