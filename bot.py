@@ -31,7 +31,7 @@ DATA_DIR = Path("/tmp/yandex_music_bot")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 auth_in_progress = set()
-export_in_progress = set()
+search_in_progress = set()
 
 
 def token_path(user_id):
@@ -49,8 +49,8 @@ def keyboard():
             ],
             [
                 InlineKeyboardButton(
-                    text="❤️ Выгрузить «Мне нравится»",
-                    callback_data="export_likes",
+                    text="🔎 Проверить треки",
+                    callback_data="start_search",
                 )
             ],
         ]
@@ -78,13 +78,12 @@ async def start_web_server():
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     await message.answer(
-        "Выгрузка списка треков из Яндекс Музыки.\n\n"
+        "Проверка треков из «Мне нравится» в Яндекс Музыке.\n\n"
         "1. Нажми «Войти через Яндекс».\n"
-        "2. Подтверди вход по ссылке и коду.\n"
-        "3. Нажми «Выгрузить „Мне нравится“».\n\n"
-        "Бот отправит JSON с названиями, исполнителями, "
-        "ID, длительностью и обложками, если эти данные "
-        "удастся получить через API.",
+        "2. Подтверди авторизацию.\n"
+        "3. Нажми «Проверить треки».\n\n"
+        "Бот отправит JSON-отчёт. Он не читает загрузки "
+        "из памяти iPhone.",
         reply_markup=keyboard(),
     )
 
@@ -96,19 +95,19 @@ async def auth_yandex(callback: CallbackQuery):
 
     if callback.message.chat.type != "private":
         await callback.message.answer(
-            "Используй бота в личном чате."
+            "Для безопасности используй бота в личном чате."
         )
         return
 
     if user_id in auth_in_progress:
         await callback.message.answer(
-            "Авторизация уже выполняется."
+            "Авторизация уже запущена. Дождись её завершения."
         )
         return
 
     auth_in_progress.add(user_id)
     await callback.message.answer(
-        "⏳ Запрашиваю код авторизации..."
+        "⏳ Запрашиваю код авторизации у Яндекса..."
     )
 
     loop = asyncio.get_running_loop()
@@ -121,18 +120,15 @@ async def auth_yandex(callback: CallbackQuery):
             f"Срок действия: около {code.expires_in} секунд.\n"
             "Не пересылай код другим людям."
         )
-
         future = asyncio.run_coroutine_threadsafe(
             bot.send_message(user_id, text),
             loop,
         )
-        future.result(timeout=20)
+        future.result(timeout=30)
 
     def authenticate():
         temporary_client = Client()
-        auth_token = temporary_client.device_auth(
-            on_code=on_code
-        )
+        auth_token = temporary_client.device_auth(on_code=on_code)
 
         client = Client(auth_token.access_token)
         client.init()
@@ -143,10 +139,7 @@ async def auth_yandex(callback: CallbackQuery):
         access_token = await asyncio.to_thread(authenticate)
 
         path = token_path(user_id)
-        path.write_text(
-            access_token,
-            encoding="utf-8",
-        )
+        path.write_text(access_token, encoding="utf-8")
 
         try:
             os.chmod(path, 0o600)
@@ -154,8 +147,8 @@ async def auth_yandex(callback: CallbackQuery):
             pass
 
         await callback.message.answer(
-            "✅ Вход подтверждён. Теперь нажми "
-            "«Выгрузить „Мне нравится“».",
+            "✅ Авторизация завершена. Теперь нажми "
+            "«Проверить треки».",
             reply_markup=keyboard(),
         )
 
@@ -170,270 +163,400 @@ async def auth_yandex(callback: CallbackQuery):
         auth_in_progress.discard(user_id)
 
 
-def get_value(obj, key, default=None):
-    if obj is None:
-        return default
-
+def value(obj, key):
     if isinstance(obj, dict):
-        return obj.get(key, default)
-
-    return getattr(obj, key, default)
-
-
-def as_list(obj):
-    if obj is None:
-        return []
-
-    if isinstance(obj, (list, tuple)):
-        return list(obj)
-
-    try:
-        return list(obj)
-    except TypeError:
-        return [obj]
+        return obj.get(key)
+    return getattr(obj, key, None)
 
 
-def unwrap_track(obj):
-    """
-    Извлекает трек из обёртки, если API её возвращает.
-    """
-    current = obj
-
-    for _ in range(4):
-        if current is None:
-            break
-
-        nested = get_value(current, "track")
-
-        if nested is None or nested is current:
-            break
-
-        current = nested
-
-    return current
-
-
-def get_track_id(track):
-    track_id = get_value(track, "id")
-
-    if track_id is None:
-        track_id = get_value(track, "track_id")
-
-    if track_id is None:
-        return None
-
-    # Иногда ID представлен в формате "ID:ID_альбома".
-    return str(track_id).split(":")[0]
-
-
-def get_artists(track):
+def artist_names(track):
+    artists = value(track, "artists") or []
     result = []
 
-    for artist in as_list(
-        get_value(track, "artists")
-    ):
-        name = (
-            get_value(artist, "name")
-            or get_value(artist, "title")
-        )
-
+    for artist in artists:
+        name = value(artist, "name") or value(artist, "title")
         if name:
             result.append(str(name))
 
     return result
 
 
-def get_cover_url(track):
-    albums = as_list(
-        get_value(track, "albums")
-    )
+def to_plain(obj):
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
 
-    for album in albums:
-        cover = (
-            get_value(album, "cover_uri")
-            or get_value(album, "coverUri")
-        )
+    if isinstance(obj, (list, tuple)):
+        return [to_plain(item) for item in obj]
 
-        if cover:
-            return (
-                "https://"
-                + str(cover).replace("%%", "400x400")
-            )
+    if isinstance(obj, dict):
+        return {
+            str(key): to_plain(item)
+            for key, item in obj.items()
+        }
 
-    cover = (
-        get_value(track, "cover_uri")
-        or get_value(track, "coverUri")
-    )
+    method = getattr(obj, "to_dict", None)
+    if callable(method):
+        try:
+            result = method()
+            if isinstance(result, dict):
+                return to_plain(result)
+        except Exception:
+            pass
 
-    if not cover:
+    return str(obj)
+
+
+def track_summary(track):
+    if track is None:
         return None
 
-    cover = str(cover)
-
-    if cover.startswith("http://") or cover.startswith("https://"):
-        return cover
-
-    return "https://" + cover.replace("%%", "400x400")
-
-
-def summarize_track(track):
-    track = unwrap_track(track)
-
     return {
-        "id": get_track_id(track),
-        "title": get_value(track, "title"),
-        "artists": get_artists(track),
-        "duration_ms": get_value(track, "duration_ms"),
-        "cover_url": get_cover_url(track),
+        "id": str(value(track, "id"))
+        if value(track, "id") is not None else None,
+        "title": value(track, "title"),
+        "artists": artist_names(track),
+        "available": value(track, "available"),
+        "available_for_premium_users": value(
+            track, "available_for_premium_users"
+        ),
+        "error": value(track, "error"),
+        "track_source": value(track, "track_source"),
+        "real_id": value(track, "real_id"),
+        "matched_track": to_plain(value(track, "matched_track")),
+        "substituted": to_plain(value(track, "substituted")),
+        "albums": to_plain(value(track, "albums")),
+        "duration_ms": value(track, "duration_ms"),
     }
 
 
-def get_liked_items(client):
-    response = client.users_likes_tracks()
-
-    items = get_value(response, "tracks")
-
+def extract_likes(likes):
+    items = getattr(likes, "tracks", None)
     if items is None:
-        items = response
+        items = likes
 
-    return as_list(items)
+    result = []
+    seen = set()
+
+    for item in items or []:
+        track = getattr(item, "track", None) or item
+        track_id = value(track, "id")
+
+        if track_id is None:
+            continue
+
+        track_id = str(track_id)
+
+        if track_id in seen:
+            continue
+
+        seen.add(track_id)
+        result.append({
+            "id": track_id,
+            "track": track,
+        })
+
+    return result
 
 
-def get_full_tracks(client, track_ids):
-    """
-    Запрашивает полные записи треков небольшими партиями.
-    """
-    found = {}
-    errors = []
+def collect_linked_ids(track):
+    found = set()
+    if track is None:
+        return found
 
-    for start in range(0, len(track_ids), 50):
-        batch = track_ids[start:start + 50]
+    def walk(obj, depth=0):
+        if obj is None or depth > 8:
+            return
+
+        if isinstance(obj, (list, tuple, set)):
+            for item in obj:
+                walk(item, depth + 1)
+            return
+
+        if isinstance(obj, dict):
+            for key, item in obj.items():
+                key_lower = str(key).lower()
+
+                if (
+                    key_lower in {"id", "track_id", "real_id"}
+                    and item is not None
+                ):
+                    candidate = str(item).strip()
+                    if candidate.isdigit():
+                        found.add(candidate)
+
+                if isinstance(item, (dict, list, tuple)):
+                    walk(item, depth + 1)
+            return
+
+        for key in ("id", "track_id", "real_id"):
+            candidate = value(obj, key)
+            if candidate is not None:
+                candidate = str(candidate).strip()
+                if candidate.isdigit():
+                    found.add(candidate)
+
+        for key in ("matched_track", "substituted"):
+            walk(value(obj, key), depth + 1)
+
+    walk(value(track, "matched_track"))
+    walk(value(track, "substituted"))
+
+    return found
+
+
+def fetch_bulk(client, ids, errors, stage):
+    result = {}
+
+    for start in range(0, len(ids), 100):
+        batch = ids[start:start + 100]
 
         try:
             response = client.tracks(batch) or []
 
-            for item in as_list(response):
-                track = unwrap_track(item)
-                track_id = get_track_id(track)
-
+            for track in response:
+                track_id = value(track, "id")
                 if track_id is not None:
-                    found[track_id] = track
+                    result[str(track_id)] = track
 
         except Exception as error:
-            logging.exception(
-                "Ошибка получения партии треков"
-            )
-
             errors.append({
+                "stage": stage,
                 "ids": batch,
                 "error": type(error).__name__,
-                "message": str(error)[:300],
+                "message": str(error)[:400],
             })
 
-    return found, errors
+    return result
 
 
-def create_report(access_token, output_path):
+def fetch_single(client, track_id):
+    response = client.tracks([str(track_id)]) or []
+
+    for track in response:
+        returned_id = value(track, "id")
+        if returned_id is not None and str(returned_id) == str(track_id):
+            return track
+
+    return response[0] if response else None
+
+
+def run_diagnostics(access_token, output_path):
     client = Client(access_token)
     client.init()
 
-    liked_items = get_liked_items(client)
+    likes = client.users_likes_tracks()
+    liked = extract_likes(likes)
 
-    short_tracks = {}
-    track_ids = []
+    if not liked and getattr(client, "me", None):
+        likes = client.users_likes_tracks(client.me.account.uid)
+        liked = extract_likes(likes)
 
-    for item in liked_items:
-        track = unwrap_track(item)
-        summary = summarize_track(track)
-        track_id = summary["id"]
+    liked_by_id = {item["id"]: item for item in liked}
+    liked_ids = list(liked_by_id)
 
-        if not track_id:
+    errors = []
+    full_tracks = fetch_bulk(
+        client, liked_ids, errors, "bulk_liked_tracks"
+    )
+
+    single_results = {}
+
+    for track_id in liked_ids:
+        if track_id in full_tracks:
             continue
 
-        if track_id not in short_tracks:
-            short_tracks[track_id] = track
-            track_ids.append(track_id)
+        try:
+            track = fetch_single(client, track_id)
 
-    full_tracks, errors = get_full_tracks(
-        client,
-        track_ids,
-    )
+            if track is not None:
+                full_tracks[track_id] = track
+                single_results[track_id] = "returned"
+            else:
+                single_results[track_id] = "not_returned"
 
-    rows = []
+        except Exception as error:
+            single_results[track_id] = "request_error"
+            errors.append({
+                "stage": "single_liked_track",
+                "id": track_id,
+                "error": type(error).__name__,
+                "message": str(error)[:400],
+            })
 
-    for track_id in track_ids:
-        short_info = summarize_track(
-            short_tracks[track_id]
+    linked_ids = set()
+
+    for item in liked_by_id.values():
+        linked_ids.update(collect_linked_ids(item["track"]))
+
+    for track in full_tracks.values():
+        linked_ids.update(collect_linked_ids(track))
+
+    linked_ids.difference_update(liked_ids)
+
+    linked_tracks = {}
+    pending = set(linked_ids)
+
+    for depth in range(2):
+        batch_ids = sorted(pending - set(linked_tracks))
+        if not batch_ids:
+            break
+
+        fetched = fetch_bulk(
+            client,
+            batch_ids,
+            errors,
+            f"linked_tracks_pass_{depth + 1}",
         )
+        linked_tracks.update(fetched)
 
-        full_track = full_tracks.get(track_id)
+        missing_ids = [
+            track_id for track_id in batch_ids
+            if track_id not in fetched
+        ]
 
-        if full_track is not None:
-            full_info = summarize_track(full_track)
-        else:
-            full_info = {}
+        for track_id in missing_ids:
+            try:
+                track = fetch_single(client, track_id)
+                if track is not None:
+                    linked_tracks[track_id] = track
 
-        # Если полная запись не содержит поля,
-        # используем данные из исходного списка лайков.
-        row = {
-            "id": (
-                full_info.get("id")
-                or short_info.get("id")
-                or track_id
-            ),
-            "title": (
-                full_info.get("title")
-                or short_info.get("title")
-            ),
-            "artists": (
-                full_info.get("artists")
-                or short_info.get("artists")
-                or []
-            ),
-            "duration_ms": (
-                full_info.get("duration_ms")
-                or short_info.get("duration_ms")
-            ),
-            "cover_url": (
-                full_info.get("cover_url")
-                or short_info.get("cover_url")
-            ),
-            "full_record_found": (
-                full_track is not None
-            ),
-        }
+            except Exception as error:
+                errors.append({
+                    "stage": "single_linked_track",
+                    "id": track_id,
+                    "error": type(error).__name__,
+                    "message": str(error)[:400],
+                })
 
-        rows.append(row)
+        new_ids = set()
 
-    metadata_found = sum(
-        1
-        for row in rows
-        if row["title"] or row["artists"]
-    )
+        for track in linked_tracks.values():
+            new_ids.update(collect_linked_ids(track))
+
+        new_ids.difference_update(liked_ids)
+        new_ids.difference_update(linked_tracks.keys())
+        pending = new_ids
+        linked_ids.update(new_ids)
+
+    liked_rows = []
+    candidates = []
+
+    for track_id, item in liked_by_id.items():
+        short = item["track"]
+        full = full_tracks.get(track_id)
+
+        liked_rows.append({
+            "id": track_id,
+            "short_record": track_summary(short),
+            "full_record": track_summary(full),
+            "full_record_returned": full is not None,
+            "single_request_result": single_results.get(track_id),
+            "linked_ids": sorted(
+                collect_linked_ids(short)
+                | collect_linked_ids(full)
+            ),
+        })
+
+        if full is None:
+            candidates.append({
+                "id": track_id,
+                "title": value(short, "title"),
+                "artists": artist_names(short),
+                "status": "NOT_RETURNED",
+                "explanation": (
+                    "Полная запись не получена. Это может быть "
+                    "ошибка API, а не удаление."
+                ),
+            })
+
+        elif value(full, "available") is False:
+            candidates.append({
+                "id": track_id,
+                "title": value(full, "title"),
+                "artists": artist_names(full),
+                "status": "AVAILABLE_FALSE",
+                "explanation": (
+                    "API сообщает available=false. Причина "
+                    "может быть связана с регионом, правами "
+                    "или состоянием каталога."
+                ),
+            })
+
+        elif value(full, "error"):
+            candidates.append({
+                "id": track_id,
+                "title": value(full, "title"),
+                "artists": artist_names(full),
+                "status": "API_ERROR_FIELD",
+                "explanation": (
+                    "У записи заполнено поле error; требуется "
+                    "проверка."
+                ),
+            })
+
+    linked_rows = []
+
+    for track_id in sorted(linked_ids):
+        track = linked_tracks.get(track_id)
+
+        linked_rows.append({
+            "id": track_id,
+            "returned": track is not None,
+            "record": track_summary(track),
+        })
+
+        if track is None:
+            candidates.append({
+                "id": track_id,
+                "title": None,
+                "artists": [],
+                "status": "LINKED_NOT_RETURNED",
+                "explanation": (
+                    "Связанный ID не вернулся из API. "
+                    "Это не доказывает удаление."
+                ),
+            })
+
+        elif value(track, "available") is False:
+            candidates.append({
+                "id": track_id,
+                "title": value(track, "title"),
+                "artists": artist_names(track),
+                "status": "LINKED_AVAILABLE_FALSE",
+                "explanation": (
+                    "Связанная запись имеет available=false; "
+                    "нужно проверить причину."
+                ),
+            })
 
     report = {
-        "source": "Мне нравится",
-        "track_count": len(rows),
-        "metadata_found_count": metadata_found,
-        "metadata_missing_count": (
-            len(rows) - metadata_found
+        "report_type": "yandex_music_track_availability_check",
+        "warning": (
+            "Отчёт не читает локальную базу приложения "
+            "на iPhone. Он не может обнаружить треки, "
+            "полностью отсутствующие в «Мне нравится» "
+            "и в связанных записях API. Статус кандидата "
+            "не доказывает удаление."
         ),
-        "tracks": rows,
+        "summary": {
+            "liked_tracks_count": len(liked_ids),
+            "full_records_returned": len(full_tracks),
+            "liked_records_not_returned": sum(
+                1 for track_id in liked_ids
+                if track_id not in full_tracks
+            ),
+            "linked_ids_found": len(linked_ids),
+            "linked_records_returned": len(linked_tracks),
+            "candidates_for_review": len(candidates),
+            "errors_count": len(errors),
+        },
+        "candidates_for_review": candidates,
+        "liked_tracks": liked_rows,
+        "linked_catalog_records": linked_rows,
         "errors": errors,
-        "note": (
-            "Отчёт содержит метаданные, возвращённые API. "
-            "Он не читает локальные загрузки и базу данных "
-            "приложения Яндекс Музыки на iPhone. "
-            "Недоступность записи через API сама по себе "
-            "не доказывает, что трек удалён."
-        ),
     }
 
-    with open(
-        output_path,
-        "w",
-        encoding="utf-8",
-    ) as file:
+    with open(output_path, "w", encoding="utf-8") as file:
         json.dump(
             report,
             file,
@@ -442,11 +565,9 @@ def create_report(access_token, output_path):
             default=str,
         )
 
-    return report
 
-
-@dp.callback_query(F.data == "export_likes")
-async def export_likes(callback: CallbackQuery):
+@dp.callback_query(F.data == "start_search")
+async def start_search(callback: CallbackQuery):
     await callback.answer()
     user_id = callback.from_user.id
 
@@ -456,9 +577,9 @@ async def export_likes(callback: CallbackQuery):
         )
         return
 
-    if user_id in export_in_progress:
+    if user_id in search_in_progress:
         await callback.message.answer(
-            "⏳ Выгрузка уже выполняется."
+            "⏳ Проверка уже выполняется."
         )
         return
 
@@ -471,9 +592,7 @@ async def export_likes(callback: CallbackQuery):
         )
         return
 
-    access_token = path.read_text(
-        encoding="utf-8"
-    ).strip()
+    access_token = path.read_text(encoding="utf-8").strip()
 
     if not access_token:
         await callback.message.answer(
@@ -481,82 +600,56 @@ async def export_likes(callback: CallbackQuery):
         )
         return
 
-    export_in_progress.add(user_id)
+    search_in_progress.add(user_id)
 
     status = await callback.message.answer(
-        "⏳ Получаю список лайков и названия треков. "
+        "⏳ Проверяю лайки и связанные записи каталога. "
         "Это может занять несколько минут."
     )
 
-    report_path = (
-        DATA_DIR / f"playlist_{user_id}.json"
-    )
+    report_path = DATA_DIR / f"diagnostic_{user_id}.json"
 
     try:
-        report = await asyncio.to_thread(
-            create_report,
+        await asyncio.to_thread(
+            run_diagnostics,
             access_token,
             report_path,
         )
-
-        if (
-            report["track_count"] > 0
-            and report["metadata_found_count"] == 0
-        ):
-            await status.answer(
-                "⚠️ Получены ID треков, но названия "
-                "и исполнители не найдены. Отправляю "
-                "отчёт для дальнейшей диагностики."
-            )
 
         await bot.send_document(
             chat_id=user_id,
             document=FSInputFile(report_path),
             caption=(
-                f"Выгрузка завершена.\n"
-                f"Всего треков: {report['track_count']}\n"
-                f"Метаданные найдены: "
-                f"{report['metadata_found_count']}\n"
-                f"Метаданные отсутствуют: "
-                f"{report['metadata_missing_count']}"
+                "✅ Проверка завершена. В JSON есть список "
+                "кандидатов и подробные записи для проверки.\n\n"
+                "Это не окончательный список удалённых треков: "
+                "недоступность через API не всегда означает удаление."
             ),
         )
 
-        await status.answer(
-            "Готово. JSON-файл отправлен выше."
-        )
+        report_path.unlink(missing_ok=True)
+        await status.answer("Готово. Отчёт отправлен.")
 
     except Exception as error:
         logging.error(
-            "Ошибка выгрузки: %s\n%s",
+            "Ошибка диагностики: %s\n%s",
             type(error).__name__,
             traceback.format_exc(),
         )
-
         await status.answer(
             f"❌ Ошибка: {type(error).__name__}: {error}"
         )
 
     finally:
-        export_in_progress.discard(user_id)
-
-        try:
-            report_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        search_in_progress.discard(user_id)
 
 
 async def main():
-    await bot.delete_webhook(
-        drop_pending_updates=True
-    )
+    await bot.delete_webhook(drop_pending_updates=True)
 
     await asyncio.gather(
         start_web_server(),
-        dp.start_polling(
-            bot,
-            polling_timeout=30,
-        ),
+        dp.start_polling(bot, polling_timeout=30),
     )
 
 
