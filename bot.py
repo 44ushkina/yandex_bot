@@ -5,7 +5,7 @@ import urllib.request
 import urllib.parse
 import json
 from aiohttp import web
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher
 from aiogram.types import Message, FSInputFile
 from aiogram.filters import Command
 from yandex_music import Client
@@ -38,7 +38,7 @@ async def start_web_server():
     await site.start()
     logging.info(f"Web server started and listening on port {port}")
 
-# Функция поиска через открытые API (обход блокировок поисковых роботов на Render)
+# Функция поиска через открытые API инстансы
 def search_youtube_via_api(query: str):
     instances = [
         "https://vid.priv.au",
@@ -61,15 +61,12 @@ def search_youtube_via_api(query: str):
             continue
     return None
 
-# Функция скачивания с использованием прямой ссылки
+# Функция скачивания с обновленными аргументами плеера
 def download_track_from_youtube(artist: str, title: str, output_path: str = "downloads"):
     os.makedirs(output_path, exist_ok=True)
     query = f"{artist} - {title}"
     
-    # Шаг 1: Получаем прямую ссылку через публичный API без блокировок
     video_url = search_youtube_via_api(query)
-    
-    # Если через API найти не удалось, пробуем стандартный метод как запасной
     if not video_url:
         video_url = f"ytsearch1:{query}"
 
@@ -83,6 +80,8 @@ def download_track_from_youtube(artist: str, title: str, output_path: str = "dow
         'outtmpl': os.path.join(output_path, '%(id)s.%(ext)s'),
         'quiet': True,
         'no_warnings': True,
+        # Указываем клиенты web и ios, чтобы избежать ошибок извлечения player response
+        'extractor_args': {'youtube': {'player_client': ['web', 'ios']}},
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
         }
