@@ -30,13 +30,12 @@ async def start_web_server():
     app.router.add_get("/", handle_ping)
     runner = web.AppRunner(app)
     await runner.setup()
-    # Обязательный порт для Render (переменная PORT или дефолтный 10000)
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     logging.info(f"Web server started and listening on port {port}")
 
-# Функция скачивания трека через yt-dlp с обходом блокировок хостинга
+# Функция скачивания: приоритет SoundCloud для обхода блокировок хостинга
 def download_track_from_youtube(artist: str, title: str, output_path: str = "downloads"):
     os.makedirs(output_path, exist_ok=True)
     
@@ -57,10 +56,12 @@ def download_track_from_youtube(artist: str, title: str, output_path: str = "dow
         }
     }
     
+    # Сначала ищем в SoundCloud (scsearch1), где IP хостингов не заблокированы, 
+    # а затем используем запасные варианты на YouTube
     search_queries = [
-        f"ytsearch1:{query} official audio",
-        f"ytsearch1:{query}",
-        f"ytsearch1:{artist} track"
+        f"scsearch1:{query}",
+        f"ytsearch1:{query} explicit",
+        f"ytsearch1:{query}"
     ]
     
     for q in search_queries:
@@ -155,7 +156,6 @@ async def cmd_download(message: Message):
         await message.answer(f"❌ Произошла ошибка при работе с Яндекс Музыкой: {e}")
 
 async def main():
-    # Запуск веб-сервера для удержания порта Render и одновременный запуск самого бота
     await start_web_server()
     await dp.start_polling(bot)
 
