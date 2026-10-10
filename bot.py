@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import traceback
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
@@ -85,7 +86,7 @@ async def start_search(callback: CallbackQuery):
     await callback.message.edit_text("⏳ Подключаюсь к аккаунту Яндекс Музыки...")
     
     try:
-        # Надежная инициализация клиента
+        # Инициализация с выводом полной ошибки в логи Render, если что-то пойдет не так
         client = Client(token)
         client.init()
         
@@ -137,6 +138,10 @@ async def start_search(callback: CallbackQuery):
         os.remove(filename)
         
     except Exception as e:
+        # Выводим полный текст ошибки в логи Render для диагностики
+        err_msg = traceback.format_exc()
+        logging.error(f"DETAILED ERROR:\n{err_msg}")
+        
         await callback.message.answer(f"❌ Произошла ошибка: {str(e)}\n\nВозможно, токен недействителен или устарел.")
 
 async def main():
