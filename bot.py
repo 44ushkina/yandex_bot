@@ -24,7 +24,7 @@ YANDEX_TOKEN = os.environ.get("YANDEX_TOKEN", "")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Заглушка веб-сервера для прохождения проверки портов Render (Web Service)
+# Заглушка веб-сервера для удержания порта Render (Web Service)
 async def handle_ping(request):
     return web.Response(text="Bot is running!")
 
@@ -38,38 +38,12 @@ async def start_web_server():
     await site.start()
     logging.info(f"Web server started and listening on port {port}")
 
-# Функция поиска через открытые API инстансы
-def search_youtube_via_api(query: str):
-    instances = [
-        "https://vid.priv.au",
-        "https://invidious.privacyredirect.com",
-        "https://inv.nadeko.net"
-    ]
-    encoded_query = urllib.parse.quote(query)
-    
-    for instance in instances:
-        try:
-            url = f"{instance}/api/v1/search?q={encoded_query}&type=video"
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=4) as response:
-                data = json.loads(response.read().decode())
-                if data and isinstance(data, list) and len(data) > 0:
-                    video_id = data[0].get('videoId')
-                    if video_id:
-                        return f"https://www.youtube.com/watch?v={video_id}"
-        except Exception:
-            continue
-    return None
-
-# Функция скачивания с обновленными аргументами плеера
-def download_track_from_youtube(artist: str, title: str, output_path: str = "downloads"):
+# Устойчивая функция поиска и скачивания через оптимизированный профиль yt-dlp
+def download_track_clean(artist: str, title: str, output_path: str = "downloads"):
     os.makedirs(output_path, exist_ok=True)
-    query = f"{artist} - {title}"
+    clean_query = f"{artist} - {title}".replace('"', '').replace("'", "")
     
-    video_url = search_youtube_via_api(query)
-    if not video_url:
-        video_url = f"ytsearch1:{query}"
-
+    # Настройки yt-dlp с минимальным набором параметров, чтобы избежать конфликтов плееров
     ydl_opts = {
         'format': 'bestaudio/best',
         'postprocessors': [{
@@ -80,23 +54,39 @@ def download_track_from_youtube(artist: str, title: str, output_path: str = "dow
         'outtmpl': os.path.join(output_path, '%(id)s.%(ext)s'),
         'quiet': True,
         'no_warnings': True,
-        # Указываем клиенты web и ios, чтобы избежать ошибок извлечения player response
-        'extractor_args': {'youtube': {'player_client': ['web', 'ios']}},
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-        }
+        # Отключаем лишние проверки и используем обходные эмуляторы
+        'ignoreerrors': True,
+        'geo_bypass': True,
     }
     
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(video_url, download=True)
-            filename = ydl.prepare_filename(info)
-            mp3_filename = os.path.splitext(filename)[0] + ".mp3"
-            if os.path.exists(mp3_filename):
-                return mp3_filename
-    except Exception as e:
-        logging.error(f"Ошибка скачивания {query}: {e}")
-        
+    # Пробуем последовательно разные поисковые префиксы без сложных заголовков
+    queries = [
+        f"ytsearch1:{clean_query} audio",
+        f"scsearch1:{clean_query}",
+        f"ytsearch1:{clean_query}"
+    ]
+    
+    for q in queries:
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(q, download=True)
+                if not info:
+                    continue
+                # Если это результативный плейлист/поиск, берем первый элемент
+                if 'entries' in info:
+                    entries = list(info['entries'])
+                    if not entries:
+                        continue
+                    info = entries[0]
+                
+                filename = ydl.prepare_filename(info)
+                mp3_filename = os.path.splitext(filename)[0] + ".mp3"
+                if os.path.exists(mp3_filename):
+                    return mp3_filename
+        except Exception as e:
+            logging.warning(f"Попытка поиска по запросу '{q}' не удалась: {e}")
+            continue
+            
     return None
 
 @dp.message(Command("start"))
@@ -147,7 +137,7 @@ async def cmd_download(message: Message):
             
             await message.answer(f"🔍 [{i}/{len(tracks_to_process)}] Ищу оригинал: <b>{artists} — {title}</b>", parse_mode="HTML")
             
-            file_path = download_track_from_youtube(artists, title)
+            file_path = download_track_clean(artists, title)
             
             if file_path and os.path.exists(file_path):
                 try:
