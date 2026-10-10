@@ -1,14 +1,10 @@
 import os
 import asyncio
 import logging
-import urllib.request
-import urllib.parse
-import json
 from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message, FSInputFile
 from aiogram.filters import Command
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from yandex_music import Client
 import yt_dlp
 
@@ -21,46 +17,29 @@ if not BOT_TOKEN:
     raise ValueError("Не найден токен бота! Проверьте переменную окружения BOT_TOKEN в Render.")
 
 YANDEX_TOKEN = os.environ.get("YANDEX_TOKEN", "")
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Путь для вебхука Telegram
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}" if RENDER_EXTERNAL_URL else ""
+# Заглушка веб-сервера для прохождения проверки портов Render (Web Service)
+async def handle_ping(request):
+    return web.Response(text="Bot is running!")
 
-# Функция безопасного поиска трека
-def search_youtube_via_api(query: str):
-    instances = [
-        "https://vid.priv.au",
-        "https://invidious.privacyredirect.com",
-        "https://inv.nadeko.net"
-    ]
-    encoded_query = urllib.parse.quote(query)
-    
-    for instance in instances:
-        try:
-            url = f"{instance}/api/v1/search?q={encoded_query}&type=video"
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=3) as response:
-                data = json.loads(response.read().decode())
-                if data and isinstance(data, list) and len(data) > 0:
-                    video_id = data[0].get('videoId')
-                    if video_id:
-                        return f"https://www.youtube.com/watch?v={video_id}"
-        except Exception:
-            continue
-    return None
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"Web server started and listening on port {port}")
 
+# Функция безопасного скачивания
 def download_track_clean(artist: str, title: str, output_path: str = "downloads"):
     os.makedirs(output_path, exist_ok=True)
     clean_query = f"{artist} - {title}".replace('"', '').replace("'", "")
     
-    video_url = search_youtube_via_api(clean_query)
-    if not video_url:
-        video_url = f"ytsearch1:{clean_query}"
-
     ydl_opts = {
         'format': 'bestaudio/best',
         'postprocessors': [{
@@ -75,25 +54,31 @@ def download_track_clean(artist: str, title: str, output_path: str = "downloads"
         'ignoreerrors': True,
     }
     
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(video_url, download=True)
-            if not info:
-                return None
+    queries = [
+        f"ytsearch1:{clean_query} audio",
+        f"scsearch1:{clean_query}",
+        f"ytsearch1:{clean_query}"
+    ]
+    
+    for q in queries:
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(q, download=True)
+                if not info:
+                    continue
+                if 'entries' in info:
+                    entries = list(info['entries'])
+                    if not entries or entries[0] is None:
+                        continue
+                    info = entries[0]
+                
+                filename = ydl.prepare_filename(info)
+                mp3_filename = os.path.splitext(filename)[0] + ".mp3"
+                if os.path.exists(mp3_filename):
+                    return mp3_filename
+        except Exception:
+            continue
             
-            if 'entries' in info:
-                entries = list(info['entries'])
-                if not entries or entries[0] is None:
-                    return None
-                info = entries[0]
-            
-            filename = ydl.prepare_filename(info)
-            mp3_filename = os.path.splitext(filename)[0] + ".mp3"
-            if os.path.exists(mp3_filename):
-                return mp3_filename
-    except Exception as e:
-        logging.warning(f"Ошибка скачивания '{clean_query}': {e}")
-        
     return None
 
 @dp.message(Command("start"))
@@ -174,38 +159,14 @@ async def cmd_download(message: Message):
     except Exception as e:
         await message.answer(f"❌ Произошла ошибка при работе с Яндекс Музыкой: {e}")
 
-async def on_startup(bot: Bot):
-    if WEBHOOK_URL:
-        await bot.set_webhook(WEBHOOK_URL)
-        logging.info(f"Webhook successfully set to {WEBHOOK_URL}")
-    else:
-        logging.warning("RENDER_EXTERNAL_URL is missing! Webhook could not be set automatically.")
-
 async def main():
-    app = web.Application()
+    # Запускаем фоновый веб-сервер для прохождения проверки портов Render
+    asyncio.create_task(start_web_server())
     
-    # Регистрация вебхук-обработчика aiogram в aiohttp
-    webhook_requests_handler = SimpleRequestHandler(
-        dispatcher=dp,
-        bot=bot,
-    )
-    webhook_requests_handler.register(app, path=WEBHOOK_PATH)
-    setup_application(app, dp, bot=bot)
-    
-    app.router.add_get("/", lambda request: web.Response(text="Bot is running via Webhooks!"))
-
-    port = int(os.environ.get("PORT", 10000))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    
-    dp.startup.register(on_startup)
-    
-    await site.start()
-    logging.info(f"Webhook server started on port {port}")
-    
-    # Бесконечное удержание процесса активным
-    await asyncio.Event().wait()
+    # Удаляем вебхуки и запускаем polling с принудительным сбросом старых зависших запросов (drop_pending_updates=True)
+    await bot.delete_webhook(drop_pending_updates=True)
+    logging.info("Starting polling...")
+    await dp.start_polling(bot, drop_pending_updates=True)
 
 if __name__ == "__main__":
     asyncio.run(main())
