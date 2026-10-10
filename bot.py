@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# --- МИНИ-СЕРВЕР ДЛЯ RENDER (чтобы он не ругался на закрытые порты) ---
+# --- МИНИ-СЕРВЕР ДЛЯ RENDER ---
 async def handle_ping(request):
     return web.Response(text="Bot is running!")
 
@@ -23,12 +23,11 @@ async def start_web_server():
     runner = web.AppRunner(app)
     await runner.setup()
     
-    # Render передает порт через переменную окружения PORT, по умолчанию берем 10000
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logging.info(f"Web server started on port {port}")
-# ------------------------------------------------------------------
+    logging.info(f"Web server successfully started on port {port}")
+# ------------------------------
 
 def get_start_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -136,12 +135,13 @@ async def start_search(callback: CallbackQuery):
         await callback.message.answer(f"❌ Произошла ошибка: {str(e)}\n\nВозможно, токен недействителен или устарел.")
 
 async def main():
-    # Запускаем веб-сервер для Render, чтобы он видел открытый порт
-    await start_web_server()
-    
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("🤖 Бот успешно запущен и работает!")
-    await dp.start_polling(bot, polling_timeout=30)
+    
+    logging.info("🤖 Запуск веб-сервера и бота...")
+    await asyncio.gather(
+        start_web_server(),
+        dp.start_polling(bot, polling_timeout=30)
+    )
 
 if __name__ == "__main__":
-    asyncio.run(main()) 
+    asyncio.run(main())
