@@ -8,6 +8,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message, FSInputFile
 from aiogram.filters import Command
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from yandex_music import Client
 import yt_dlp
 
@@ -20,25 +21,16 @@ if not BOT_TOKEN:
     raise ValueError("Не найден токен бота! Проверьте переменную окружения BOT_TOKEN в Render.")
 
 YANDEX_TOKEN = os.environ.get("YANDEX_TOKEN", "")
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Заглушка веб-сервера для удержания порта Render (Web Service)
-async def handle_ping(request):
-    return web.Response(text="Bot is running!")
+# Путь для вебхука Telegram
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}" if RENDER_EXTERNAL_URL else ""
 
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get("/", handle_ping)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 10000))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logging.info(f"Web server started and listening on port {port}")
-
-# Безопасный поиск через открытые API инстансы
+# Функция безопасного поиска трека
 def search_youtube_via_api(query: str):
     instances = [
         "https://vid.priv.au",
@@ -61,17 +53,14 @@ def search_youtube_via_api(query: str):
             continue
     return None
 
-# Функция скачивания с защитой от None и эмуляцией Android/TV клиента
 def download_track_clean(artist: str, title: str, output_path: str = "downloads"):
     os.makedirs(output_path, exist_ok=True)
     clean_query = f"{artist} - {title}".replace('"', '').replace("'", "")
     
-    # Сначала ищем через Invidious API
     video_url = search_youtube_via_api(clean_query)
     if not video_url:
         video_url = f"ytsearch1:{clean_query}"
 
-    # Используем клиенты android/tv для обхода блокировок плеера на хостингах
     ydl_opts = {
         'format': 'bestaudio/best',
         'postprocessors': [{
@@ -92,7 +81,6 @@ def download_track_clean(artist: str, title: str, output_path: str = "downloads"
             if not info:
                 return None
             
-            # Если это плейлист/результат поиска, берем первый элемент
             if 'entries' in info:
                 entries = list(info['entries'])
                 if not entries or entries[0] is None:
@@ -186,9 +174,38 @@ async def cmd_download(message: Message):
     except Exception as e:
         await message.answer(f"❌ Произошла ошибка при работе с Яндекс Музыкой: {e}")
 
+async def on_startup(bot: Bot):
+    if WEBHOOK_URL:
+        await bot.set_webhook(WEBHOOK_URL)
+        logging.info(f"Webhook successfully set to {WEBHOOK_URL}")
+    else:
+        logging.warning("RENDER_EXTERNAL_URL is missing! Webhook could not be set automatically.")
+
 async def main():
-    await start_web_server()
-    await dp.start_polling(bot)
+    app = web.Application()
+    
+    # Регистрация вебхук-обработчика aiogram в aiohttp
+    webhook_requests_handler = SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+    )
+    webhook_requests_handler.register(app, path=WEBHOOK_PATH)
+    setup_application(app, dp, bot=bot)
+    
+    app.router.add_get("/", lambda request: web.Response(text="Bot is running via Webhooks!"))
+
+    port = int(os.environ.get("PORT", 10000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    
+    dp.startup.register(on_startup)
+    
+    await site.start()
+    logging.info(f"Webhook server started on port {port}")
+    
+    # Бесконечное удержание процесса активным
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     asyncio.run(main())
