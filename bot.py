@@ -36,7 +36,7 @@ async def start_web_server():
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     # Используем официальную ссылку получения токена через Яндекс.Паспорт
-    auth_url = "https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd491ba4b8ec639eb437c5"
+ auth_url = "https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd418abb4b39c32c41195d"
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔐 Получить OAuth-токен", url=auth_url)],
