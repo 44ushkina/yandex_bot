@@ -79,7 +79,6 @@ async def start_search(callback: CallbackQuery):
     await callback.message.edit_text("⏳ Подключаюсь к аккаунту Яндекс Музыки через сессию...")
     
     try:
-        # Авторизация через куку Session_id (обходит все ограничения OAuth)
         client = Client.from_credentials(session_id)
         client.init()
         
@@ -139,7 +138,8 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     
     logging.info("🤖 Запуск веб-сервера и бота...")
-    async asyncio.gather(
+    # Исправлен синтаксис вызова
+    await asyncio.gather(
         start_web_server(),
         dp.start_polling(bot, polling_timeout=30)
     )
