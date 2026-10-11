@@ -592,6 +592,130 @@ def download_track_public(artists, title, orig_duration=None, allow_relaxed=True
     return None, None
 
 
+# ---------- диагностика источников (команда /diag) ----------
+class CaptureLogger:
+    """Собирает сообщения yt-dlp, чтобы показать их в диагностике."""
+
+    def __init__(self):
+        self.msgs = []
+
+    def debug(self, msg):
+        pass
+
+    def info(self, msg):
+        pass
+
+    def warning(self, msg):
+        self.msgs.append(str(msg))
+
+    def error(self, msg):
+        self.msgs.append(str(msg))
+        note_yt_error(msg)
+
+
+def _short(text, limit=220):
+    text = re.sub(r"\s+", " ", str(text)).strip()
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def run_diagnostics(query):
+    """Проверяет YouTube и SoundCloud на одном запросе и возвращает отчёт текстом."""
+    lines = []
+    try:
+        version = yt_dlp.version.__version__
+    except Exception:
+        version = "неизвестна"
+    lines.append(f"yt-dlp: версия {version}")
+    lines.append(f"JS-движок: {'подключён' if JS_OPTS else 'НЕ подключён'}")
+    lines.append(f"Cookies: {'есть' if COOKIE_FILE else 'нет'}")
+    lines.append(f"YouTube помечен как заблокированный: {'да' if yt_is_blocked() else 'нет'}")
+    lines.append(f"Запрос: {query}")
+    lines.append("")
+
+    # --- YouTube: поиск ---
+    cap = CaptureLogger()
+    opts = {
+        "quiet": True,
+        "skip_download": True,
+        "extract_flat": True,
+        "ignore_no_formats_error": True,
+        "socket_timeout": 30,
+        "logger": cap,
+    }
+    if COOKIE_FILE:
+        opts["cookiefile"] = COOKIE_FILE
+    entries = []
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"ytsearch4:{query}", download=False)
+        entries = [e for e in ((info or {}).get("entries") or []) if e]
+    except Exception as e:
+        cap.msgs.append(str(e))
+    lines.append(f"YouTube, поиск: результатов {len(entries)}")
+    for e in entries[:3]:
+        lines.append(
+            f"  • {_short(e.get('title'), 60)} — {_short(e.get('channel') or e.get('uploader'), 40)} "
+            f"({e.get('duration')} с)"
+        )
+    for m in cap.msgs[:2]:
+        lines.append(f"  ! {_short(m)}")
+
+    # --- YouTube: доступны ли форматы у первого видео (без скачивания) ---
+    if entries:
+        url = entries[0].get("url") or entries[0].get("webpage_url")
+        cap2 = CaptureLogger()
+        o2 = {
+            "quiet": True,
+            "skip_download": True,
+            "format": "bestaudio/best",
+            "noplaylist": True,
+            "socket_timeout": 45,
+            "logger": cap2,
+        }
+        if COOKIE_FILE:
+            o2["cookiefile"] = COOKIE_FILE
+        o2.update(JS_OPTS)
+        try:
+            with yt_dlp.YoutubeDL(o2) as ydl:
+                inf = ydl.extract_info(url, download=False)
+            fmts = (inf or {}).get("formats") or []
+            audio = [f for f in fmts if f.get("acodec") not in (None, "none")]
+            lines.append(f"YouTube, видео 1: форматов {len(fmts)}, из них с аудио {len(audio)}")
+        except Exception as e:
+            cap2.msgs.append(str(e))
+            lines.append("YouTube, видео 1: форматы получить НЕ удалось")
+        for m in cap2.msgs[:2]:
+            lines.append(f"  ! {_short(m)}")
+    lines.append("")
+
+    # --- SoundCloud: поиск ---
+    cap3 = CaptureLogger()
+    o3 = {
+        "quiet": True,
+        "skip_download": True,
+        "ignoreerrors": True,
+        "ignore_no_formats_error": True,
+        "socket_timeout": 30,
+        "logger": cap3,
+    }
+    sc_entries = []
+    try:
+        with yt_dlp.YoutubeDL(o3) as ydl:
+            info = ydl.extract_info(f"scsearch4:{query}", download=False)
+        sc_entries = [e for e in ((info or {}).get("entries") or []) if e]
+    except Exception as e:
+        cap3.msgs.append(str(e))
+    lines.append(f"SoundCloud, поиск: результатов {len(sc_entries)}")
+    for e in sc_entries[:3]:
+        lines.append(
+            f"  • {_short(e.get('title'), 60)} — {_short(e.get('uploader'), 30)} ({e.get('duration')} с)"
+        )
+    drm = sum(1 for m in cap3.msgs if "DRM" in m)
+    if drm:
+        lines.append(f"  ! {drm} рез. закрыты защитой (DRM)")
+    return "\n".join(lines)
+
+
 # ---------- разбор диапазона ----------
 def parse_selection(arg_text, total):
     """
@@ -1012,6 +1136,23 @@ async def cmd_stop(message: Message):
         await message.answer("⏹ Останавливаю после текущего трека...")
     else:
         await message.answer("Сейчас нет активного переноса.")
+
+
+@dp.message(Command("diag"))
+async def cmd_diag(message: Message):
+    """Скрытая команда проверки источников: /diag или /diag Исполнитель - Название"""
+    parts = (message.text or "").split(maxsplit=1)
+    query = parts[1].strip() if len(parts) > 1 else "Bruno Mars - Talking to the Moon"
+    wait = await message.answer("🔧 Проверяю источники, это может занять до минуты...")
+    try:
+        report = await asyncio.to_thread(run_diagnostics, query)
+    except Exception as e:
+        logging.exception("Сбой диагностики")
+        report = f"Диагностика упала: {e}"
+    try:
+        await wait.edit_text(html.escape(report)[:3900])
+    except Exception:
+        await message.answer(html.escape(report)[:3900])
 
 
 # ---------- кнопки (callback) ----------
