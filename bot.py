@@ -122,6 +122,10 @@ MAX_DURATION_DIFF = 7
 # и подписываются предупреждением.
 RELAXED_DURATION_DIFF = 40
 
+# Сколько секунд максимум искать один трек. Если за это время подходящая версия не найдена,
+# бот переходит к следующему треку. Меньше число: быстрее, но реже находит редкие треки.
+TRACK_TIME_LIMIT = 120
+
 # Размер одной части при переносе частями
 PART_SIZE = 100
 
@@ -448,27 +452,33 @@ def download_track_public(artists, title, orig_duration=None, allow_relaxed=True
     title_core_words = norm_words(title_core)
     title_full_words = norm_words(title)
 
-    # варианты запроса: от самого точного к более простым (без повторов)
+    # два самых полезных варианта запроса (без повторов); более расплывчатые только
+    # замедляли поиск и почти не находили новых совпадений
     query_texts = []
     for text in (
         f"{artists} - {title}",
         f"{first_artist} - {title_core}",
-        f"{title_core} {first_artist}",
     ):
         if text not in query_texts:
             query_texts.append(text)
 
-    # для YouTube добавляем запрос, который выводит автоматические «Topic»-каналы с оригиналами
-    yt_texts = query_texts + [f"{first_artist} {title_core} topic"]
+    # для YouTube второй запрос выводит автоматические «Topic»-каналы с оригиналами
+    yt_texts = query_texts[:1] + [f"{first_artist} {title_core} topic"]
 
-    sources = [("scsearch8", query_texts), ("ytsearch5", yt_texts)]
+    sources = [("scsearch6", query_texts), ("ytsearch4", yt_texts)]
     # зарубежные треки на YouTube находятся заметно лучше, чем на SoundCloud
     if is_mostly_latin(f"{artists} {title}"):
         sources.reverse()
     relaxed_pool = {}
 
+    # общий лимит времени на один трек, чтобы бот не зависал на ненайденных
+    deadline = time.time() + TRACK_TIME_LIMIT
+
     for source, texts in sources:
         for text in texts:
+            if time.time() > deadline:
+                logging.info(f"Лимит времени на трек ({TRACK_TIME_LIMIT} с) исчерпан")
+                break
             if source.startswith("ytsearch") and yt_is_blocked():
                 logging.info("YouTube сейчас блокирует сервер, пропускаю")
                 break
@@ -482,7 +492,7 @@ def download_track_public(artists, title, orig_duration=None, allow_relaxed=True
                 if url and url not in relaxed_pool:
                     relaxed_pool[url] = cand
             # пробуем скачать до 3 лучших точных результатов
-            for score, diff, entry in strict[:3]:
+            for score, diff, entry in strict[:2]:
                 url = entry.get("webpage_url") or entry.get("url")
                 if not url:
                     continue
@@ -495,7 +505,9 @@ def download_track_public(artists, title, orig_duration=None, allow_relaxed=True
     if not allow_relaxed:
         return None, None
     pool = sorted(relaxed_pool.values(), key=lambda c: (c[4], c[1], -c[0]))
-    for score, diff, entry, reason, is_bad in pool[:3]:
+    for score, diff, entry, reason, is_bad in pool[:2]:
+        if time.time() > deadline + 60:
+            break
         url = entry.get("webpage_url") or entry.get("url")
         logging.info(f"Запасной вариант: '{entry.get('title')}' ({reason})")
         path = download_url(url)
