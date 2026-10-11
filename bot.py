@@ -133,19 +133,39 @@ async def start_web_server():
 
 
 # ---------- Яндекс Музыка (синхронные функции, вызываются через to_thread) ----------
-def yandex_get_playlist(token, user_login, kind):
-    """Возвращает (название плейлиста, список треков)."""
+def yandex_get_playlist(token, login=None, kind=None, uuid=None):
+    """
+    Возвращает (название плейлиста, список треков).
+    Два формата ссылок:
+      старый: music.yandex.ru/users/ЛОГИН/playlists/НОМЕР  -> login + kind
+      новый:  music.yandex.ru/playlists/lk.xxxxxxxx-...     -> uuid
+    """
     client = Client(token).init() if token else Client().init()
-    kind = int(kind)
-    playlist = client.users_playlists(kind, user_login)
-    if isinstance(playlist, list):
-        playlist = playlist[0]
+
+    if uuid:
+        playlist = None
+        # пробуем идентификатор целиком (с "lk.") и без префикса
+        for candidate in dict.fromkeys([uuid, uuid.split(".", 1)[-1]]):
+            try:
+                playlist = client.playlist(candidate)
+            except Exception as e:
+                logging.warning(f"Плейлист {candidate} не открылся: {e}")
+                playlist = None
+            if playlist:
+                break
+        if not playlist:
+            raise ValueError("Плейлист по этой ссылке не найден")
+    else:
+        playlist = client.users_playlists(int(kind), login)
+        if isinstance(playlist, list):
+            playlist = playlist[0]
+
     tracks = list(playlist.tracks or [])
     if not tracks:
         tracks = list(playlist.fetch_tracks() or [])
     title = getattr(playlist, "title", None) or "Плейлист"
     # «Мне нравится» (kind=3): Яндекс отдаёт от новых к старым, разворачиваем
-    if kind == 3 and LIKES_OLDEST_FIRST:
+    if getattr(playlist, "kind", None) == 3 and LIKES_OLDEST_FIRST:
         tracks.reverse()
     return title, tracks
 
@@ -404,9 +424,13 @@ INFO_TEXTS = {
         "Откройте плейлист в Яндекс Музыке в браузере и скопируйте адрес из адресной строки. "
         "Он должен выглядеть так:\n"
         "<code>music.yandex.ru/users/ЛОГИН/playlists/НОМЕР</code>\n\n"
+        "<b>Подойдут оба вида ссылок</b>\n"
+        "<code>music.yandex.ru/playlists/lk.…</code> (кнопка «Поделиться») и "
+        "<code>music.yandex.ru/users/ЛОГИН/playlists/НОМЕР</code>. "
+        "Параметры после знака «?» можно не убирать.\n\n"
         "<b>«Мне нравится»</b>\n"
-        "Ссылка заканчивается на <code>/playlists/3</code>. В настройках приватности "
-        "Яндекс Музыки плейлисты должны быть открыты.\n\n"
+        "Откройте плейлист и нажмите «Поделиться». В настройках приватности "
+        "Яндекс Музыки плейлист должен быть открыт.\n\n"
         "<b>Бот пишет, что не может открыть плейлист</b>\n"
         "Скорее всего, плейлист закрыт для посторонних. Откройте доступ и отправьте ссылку снова.\n\n"
         "<b>Команды</b>\n"
@@ -485,8 +509,13 @@ stop_events = {}   # user_id -> asyncio.Event
 WORK_LOCK = asyncio.Lock()  # перенос идёт по одному плейлисту за раз
 queue_ids = []     # кто ждёт очереди
 
+# старый формат: music.yandex.ru/users/ЛОГИН/playlists/НОМЕР
 LINK_RE = re.compile(
     r"music\.yandex\.(?:ru|com|by|kz|uz)/users/([^/\s?#]+)/playlists/(\d+)", re.IGNORECASE
+)
+# новый формат: music.yandex.ru/playlists/lk.xxxxxxxx-xxxx-... (параметры после ? игнорируются)
+NEW_LINK_RE = re.compile(
+    r"music\.yandex\.(?:ru|com|by|kz|uz)/playlists/([\w.\-]+)", re.IGNORECASE
 )
 
 
@@ -751,13 +780,15 @@ async def on_callback(cb: CallbackQuery):
 
 
 # ---------- обработка ссылок и текста ----------
-async def handle_link(message: Message, login, kind):
+async def handle_link(message: Message, login=None, kind=None, uuid=None):
     user_id = message.from_user.id
     wait = await message.answer("🔎 Открываю плейлист...")
     try:
-        title, tracks = await asyncio.to_thread(yandex_get_playlist, YANDEX_TOKEN, login, kind)
+        title, tracks = await asyncio.to_thread(
+            yandex_get_playlist, YANDEX_TOKEN, login, kind, uuid
+        )
     except Exception as e:
-        logging.warning(f"Не удалось открыть плейлист {login}/{kind}: {e}")
+        logging.warning(f"Не удалось открыть плейлист {login}/{kind}/{uuid}: {e}")
         await wait.edit_text(
             "❌ <b>Не получилось открыть плейлист.</b>\n\n"
             "Проверьте, что плейлист открыт для всех, а ссылка скопирована полностью. "
@@ -787,14 +818,21 @@ async def on_text(message: Message):
 
     match = LINK_RE.search(text)
     if match:
-        await handle_link(message, match.group(1), match.group(2))
+        await handle_link(message, login=match.group(1), kind=match.group(2))
+        return
+
+    new_match = NEW_LINK_RE.search(text)
+    if new_match:
+        await handle_link(message, uuid=new_match.group(1))
         return
 
     if "music.yandex" in text.lower():
         await message.answer(
-            "🤔 Не вижу в ссылке логин и номер плейлиста.\n\n"
-            "Откройте плейлист в браузере и скопируйте адрес из адресной строки. "
-            "Он должен выглядеть так:\n"
+            "🤔 Не вижу в ссылке плейлиста.\n\n"
+            "Откройте плейлист в Яндекс Музыке и нажмите «Поделиться» или скопируйте адрес "
+            "из адресной строки. Он должен выглядеть так:\n"
+            "<code>music.yandex.ru/playlists/lk.…</code>\n"
+            "или\n"
             "<code>music.yandex.ru/users/ЛОГИН/playlists/НОМЕР</code>",
             reply_markup=kb([btn("❓ Помощь", "info:help:menu")]),
         )
