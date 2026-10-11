@@ -4,6 +4,10 @@ import io
 import time
 import shutil
 import random
+import zipfile
+import platform
+import subprocess
+import urllib.request
 import html
 import asyncio
 import difflib
@@ -99,6 +103,50 @@ class YtLogger:
     def error(self, msg):
         if not note_yt_error(msg):
             logging.warning(f"yt-dlp: {str(msg)[:200]}")
+
+
+# ---------- JavaScript-движок для YouTube ----------
+# Без него YouTube отдаёт yt-dlp только картинки, и на каждом видео возникает ошибка
+# "Requested format is not available". Движок Deno скачивается один раз при запуске бота.
+JS_OPTS = {}
+
+
+def ensure_js_runtime():
+    """Скачивает (если нужно) Deno и подключает его к yt-dlp. Ошибки не должны ронять бота."""
+    global JS_OPTS
+    try:
+        bin_dir = os.path.abspath("bin")
+        deno_path = shutil.which("deno") or os.path.join(bin_dir, "deno")
+        if not os.path.exists(deno_path):
+            os.makedirs(bin_dir, exist_ok=True)
+            arch = "aarch64" if platform.machine().lower() in ("aarch64", "arm64") else "x86_64"
+            url = (
+                "https://github.com/denoland/deno/releases/latest/download/"
+                f"deno-{arch}-unknown-linux-gnu.zip"
+            )
+            zip_path = os.path.join(bin_dir, "deno.zip")
+            logging.info("Скачиваю JavaScript-движок Deno для YouTube...")
+            urllib.request.urlretrieve(url, zip_path)
+            with zipfile.ZipFile(zip_path) as z:
+                z.extractall(bin_dir)
+            os.remove(zip_path)
+            deno_path = os.path.join(bin_dir, "deno")
+            os.chmod(deno_path, 0o755)
+
+        version = subprocess.run(
+            [deno_path, "--version"], capture_output=True, text=True, timeout=30
+        ).stdout.strip().split("\n")[0]
+        logging.info(f"JavaScript-движок готов: {version}")
+
+        # настройки формируем тем же разбором, что и у командной строки yt-dlp:
+        # так структура всегда подходит к установленной версии
+        parsed = yt_dlp.parse_options(["--js-runtimes", f"deno:{deno_path}"])
+        ydl_opts = parsed[-1]
+        JS_OPTS = {k: ydl_opts[k] for k in ("js_runtimes",) if k in ydl_opts}
+        logging.info(f"Настройки JS для yt-dlp: {JS_OPTS}")
+    except (Exception, SystemExit) as e:
+        JS_OPTS = {}
+        logging.warning(f"Не удалось подключить JavaScript-движок: {e}")
 
 
 def with_retry(fn, *args, tries=4, delay=3):
@@ -250,14 +298,36 @@ def yandex_get_playlist(token, login=None, kind=None, uuid=None):
         if isinstance(playlist, list):
             playlist = playlist[0]
 
-    tracks = list(playlist.tracks or [])
-    if not tracks:
-        tracks = list(playlist.fetch_tracks() or [])
     title = getattr(playlist, "title", None) or "Плейлист"
+    declared = getattr(playlist, "track_count", None)  # сколько треков заявляет сам Яндекс
+
+    # Яндекс по-разному отдаёт список в разных запросах (часть треков может теряться),
+    # поэтому собираем несколько вариантов и берём самый полный
+    candidates = {"playlist.tracks": list(playlist.tracks or [])}
+    try:
+        candidates["fetch_tracks"] = list(playlist.fetch_tracks() or [])
+    except Exception as e:
+        logging.info(f"fetch_tracks недоступен: {e}")
+    try:
+        owner_uid = getattr(getattr(playlist, "owner", None), "uid", None)
+        kind_value = getattr(playlist, "kind", None)
+        if owner_uid and kind_value is not None:
+            other = client.users_playlists(kind_value, owner_uid)
+            if isinstance(other, list):
+                other = other[0] if other else None
+            if other is not None:
+                candidates["users_playlists"] = list(other.tracks or [])
+    except Exception as e:
+        logging.info(f"users_playlists недоступен: {e}")
+
+    sizes = {name: len(items) for name, items in candidates.items()}
+    logging.info(f"Плейлист '{title}': заявлено Яндексом={declared}, получено={sizes}")
+    tracks = list(max(candidates.values(), key=len))
+
     # «Мне нравится» (kind=3): Яндекс отдаёт от новых к старым, разворачиваем
     if getattr(playlist, "kind", None) == 3 and LIKES_OLDEST_FIRST:
         tracks.reverse()
-    return title, tracks
+    return title, tracks, declared
 
 
 def yandex_track_info(short_track):
@@ -345,6 +415,10 @@ def search_candidates(query, artist_words, first_artist_words, title_core_words,
     }
     if COOKIE_FILE:
         opts["cookiefile"] = COOKIE_FILE
+    # для поиска нужны только название, канал и длительность, а не форматы видео
+    opts["ignore_no_formats_error"] = True
+    if query.startswith("ytsearch"):
+        opts["extract_flat"] = True  # быстро и без проверки форматов каждого видео
     strict, relaxed = [], []
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -419,6 +493,7 @@ def download_url(url):
     }
     if COOKIE_FILE:
         opts["cookiefile"] = COOKIE_FILE
+    opts.update(JS_OPTS)
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -548,8 +623,7 @@ MENU_TEXT = (
     "Я переношу плейлисты из Яндекс Музыки в Telegram: название, исполнитель, "
     "обложка и сам трек.\n\n"
     "<b>Как начать</b>\n"
-    "Просто отправьте мне ссылку на плейлист, например:\n"
-    "<code>music.yandex.ru/users/ЛОГИН/playlists/НОМЕР</code>\n\n"
+    "Просто отправьте мне ссылку на плейлист.\n\n"
     "Нужна помощь со ссылкой? Загляните в раздел «Помощь» ниже 👇"
 )
 
@@ -588,13 +662,9 @@ INFO_TEXTS = {
     "help": (
         "❓ <b>Помощь</b>\n\n"
         "<b>Где взять ссылку?</b>\n"
-        "Откройте плейлист в Яндекс Музыке в браузере и скопируйте адрес из адресной строки. "
-        "Он должен выглядеть так:\n"
-        "<code>music.yandex.ru/users/ЛОГИН/playlists/НОМЕР</code>\n\n"
-        "<b>Подойдут оба вида ссылок</b>\n"
-        "<code>music.yandex.ru/playlists/lk.…</code> (кнопка «Поделиться») и "
-        "<code>music.yandex.ru/users/ЛОГИН/playlists/НОМЕР</code>. "
-        "Параметры после знака «?» можно не убирать.\n\n"
+        "Откройте плейлист в Яндекс Музыке, нажмите «Поделиться» и скопируйте ссылку. "
+        "Можно также скопировать адрес из адресной строки браузера. "
+        "Всё, что идёт после знака «?», можно не убирать.\n\n"
         "<b>«Мне нравится»</b>\n"
         "Откройте плейлист и нажмите «Поделиться». В настройках приватности "
         "Яндекс Музыки плейлист должен быть открыт.\n\n"
@@ -642,9 +712,17 @@ def card_text(session):
             "🌐 <b>Режим: максимум.</b> Найдётся больше, но часть треков может оказаться "
             "другой версией. Такие треки будут подписаны ⚠️."
         )
+    declared = session.get("declared")
+    count_note = ""
+    if declared and declared != session["total"]:
+        count_note = (
+            f"ℹ️ Яндекс указывает {declared}, а список отдал {session['total']}: "
+            "часть треков могла быть удалена или скрыта.\n"
+        )
     return (
         f"📀 <b>{html.escape(session['title'])}</b>\n"
         f"🎵 Треков: <b>{session['total']}</b>\n"
+        f"{count_note}"
         f"⏱ Весь плейлист: {fmt_time(session['total'])}\n\n"
         f"{mode_line}\n\n"
         "Как переносить?\n"
@@ -1029,7 +1107,7 @@ async def handle_link(message: Message, login=None, kind=None, uuid=None):
     user_id = message.from_user.id
     wait = await message.answer("🔎 Открываю плейлист...")
     try:
-        title, tracks = await asyncio.to_thread(
+        title, tracks, declared = await asyncio.to_thread(
             with_retry, yandex_get_playlist, YANDEX_TOKEN, login, kind, uuid, tries=2
         )
     except Exception as e:
@@ -1050,6 +1128,7 @@ async def handle_link(message: Message, login=None, kind=None, uuid=None):
         "title": title,
         "tracks": tracks,
         "total": len(tracks),
+        "declared": declared,
         "awaiting_range": False,
         "mode": "exact",
     }
@@ -1075,11 +1154,7 @@ async def on_text(message: Message):
     if "music.yandex" in text.lower():
         await message.answer(
             "🤔 Не вижу в ссылке плейлиста.\n\n"
-            "Откройте плейлист в Яндекс Музыке и нажмите «Поделиться» или скопируйте адрес "
-            "из адресной строки. Он должен выглядеть так:\n"
-            "<code>music.yandex.ru/playlists/lk.…</code>\n"
-            "или\n"
-            "<code>music.yandex.ru/users/ЛОГИН/playlists/НОМЕР</code>",
+            "Откройте плейлист в Яндекс Музыке, нажмите «Поделиться» и отправьте мне скопированную ссылку.",
             reply_markup=kb([btn("❓ Помощь", "info:help:menu")]),
         )
         return
@@ -1128,6 +1203,7 @@ async def setup_bot_profile():
 
 async def main():
     asyncio.create_task(start_web_server())
+    await asyncio.to_thread(ensure_js_runtime)
     await bot.delete_webhook(drop_pending_updates=True)
     await setup_bot_profile()
     logging.info("Polling started")
