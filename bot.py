@@ -5,6 +5,7 @@ import time
 import shutil
 import random
 import zipfile
+import tarfile
 import platform
 import subprocess
 import urllib.request
@@ -86,11 +87,10 @@ def note_yt_error(message, youtube_context=False):
     if youtube_context and "403" in text and "Forbidden" in text:
         blocked = True
     if blocked:
+        minutes = 30 if WARP_PROXY else YT_BLOCK_MINUTES
         if not yt_is_blocked():
-            logging.warning(
-                f"YouTube блокирует сервер, отключаю его на {YT_BLOCK_MINUTES} мин"
-            )
-        YT_BLOCKED_UNTIL = time.time() + YT_BLOCK_MINUTES * 60
+            logging.warning(f"YouTube блокирует сервер, отключаю его на {minutes} мин")
+        YT_BLOCKED_UNTIL = time.time() + minutes * 60
         return True
     return False
 
@@ -157,6 +157,149 @@ def ensure_js_runtime():
     except (Exception, SystemExit) as e:
         JS_OPTS = {}
         logging.warning(f"Не удалось подключить JavaScript-движок: {e}")
+
+
+# ---------- обход блокировки YouTube через бесплатный Cloudflare WARP ----------
+# YouTube блокирует адреса хостингов (в том числе Render). Бот при запуске сам скачивает
+# программы wgcf и wireproxy, получает бесплатный WARP-аккаунт Cloudflare и пускает через него
+# ТОЛЬКО запросы к YouTube. Telegram и Яндекс работают как раньше.
+# Если есть свой прокси, его можно указать в переменной окружения YT_PROXY (например socks5h://...).
+WARP_PORT = 40000
+WARP_PROXY = None            # адрес прокси, когда он готов к работе
+WARP_STATUS = "не запускался"
+_warp_proc = None
+USER_PROXY = os.environ.get("YT_PROXY", "").strip() or None
+
+
+def _warp_arch():
+    return "arm64" if platform.machine().lower() in ("aarch64", "arm64") else "amd64"
+
+
+def _wgcf_url(arch):
+    """Ссылка на свежую версию wgcf (узнаём номер версии через редирект GitHub)."""
+    version = None
+    try:
+        req = urllib.request.Request(
+            "https://github.com/ViRb3/wgcf/releases/latest", headers={"User-Agent": "Mozilla/5.0"}
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            tag = resp.geturl().rstrip("/").split("/")[-1]  # например v2.2.29
+            if re.fullmatch(r"v\d+\.\d+\.\d+", tag):
+                version = tag[1:]
+    except Exception as e:
+        logging.warning(f"Не удалось узнать версию wgcf: {e}")
+    version = version or "2.2.29"
+    return f"https://github.com/ViRb3/wgcf/releases/download/v{version}/wgcf_{version}_linux_{arch}"
+
+
+def warp_selftest(proxy):
+    """Проверяет, отвечает ли YouTube через прокси. Возвращает число найденных результатов."""
+    opts = {
+        "quiet": True,
+        "skip_download": True,
+        "extract_flat": True,
+        "ignore_no_formats_error": True,
+        "socket_timeout": 30,
+        "logger": CaptureLogger(),
+        "proxy": proxy,
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info("ytsearch2:Bruno Mars Talking to the Moon", download=False)
+    return len([e for e in ((info or {}).get("entries") or []) if e])
+
+
+def ensure_warp():
+    """Запускает WARP-прокси для YouTube. Любые ошибки только отключают прокси, бот продолжает работать."""
+    global WARP_PROXY, WARP_STATUS, YT_BLOCKED_UNTIL, _warp_proc
+    if USER_PROXY:
+        WARP_PROXY = USER_PROXY
+        WARP_STATUS = "используется свой прокси (YT_PROXY)"
+        logging.info(WARP_STATUS)
+        return
+    try:
+        bin_dir = os.path.abspath("bin")
+        work_dir = os.path.join(bin_dir, "warp")
+        os.makedirs(work_dir, exist_ok=True)
+        arch = _warp_arch()
+
+        wireproxy = os.path.join(bin_dir, "wireproxy")
+        if not os.path.exists(wireproxy):
+            logging.info("Скачиваю wireproxy для WARP...")
+            tgz = os.path.join(bin_dir, "wireproxy.tar.gz")
+            urllib.request.urlretrieve(
+                f"https://github.com/pufferffish/wireproxy/releases/latest/download/wireproxy_linux_{arch}.tar.gz",
+                tgz,
+            )
+            with tarfile.open(tgz) as t:
+                member = next(m for m in t.getmembers() if os.path.basename(m.name) == "wireproxy")
+                member.name = "wireproxy"
+                t.extract(member, bin_dir)
+            os.remove(tgz)
+            os.chmod(wireproxy, 0o755)
+
+        wgcf = os.path.join(bin_dir, "wgcf")
+        if not os.path.exists(wgcf):
+            logging.info("Скачиваю wgcf для WARP...")
+            urllib.request.urlretrieve(_wgcf_url(arch), wgcf)
+            os.chmod(wgcf, 0o755)
+
+        profile = os.path.join(work_dir, "wgcf-profile.conf")
+        if not os.path.exists(profile):
+            last_err = ""
+            for attempt in range(3):
+                r = subprocess.run(
+                    [wgcf, "register", "--accept-tos"], cwd=work_dir,
+                    capture_output=True, text=True, timeout=90,
+                )
+                last_err = (r.stdout + r.stderr)[-300:]
+                if os.path.exists(os.path.join(work_dir, "wgcf-account.toml")):
+                    break
+                time.sleep(5 * (attempt + 1))
+            r = subprocess.run(
+                [wgcf, "generate"], cwd=work_dir, capture_output=True, text=True, timeout=60
+            )
+            last_err = (r.stdout + r.stderr)[-300:] or last_err
+            if not os.path.exists(profile):
+                raise RuntimeError(f"не удалось получить профиль WARP: {last_err}")
+
+        with open(profile, encoding="utf-8") as f:
+            conf = f.read()
+        conf_path = os.path.join(work_dir, "wireproxy.conf")
+        with open(conf_path, "w", encoding="utf-8") as f:
+            f.write(conf + f"\n[Socks5]\nBindAddress = 127.0.0.1:{WARP_PORT}\n")
+
+        _warp_proc = subprocess.Popen(
+            [wireproxy, "-c", conf_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        time.sleep(4)
+        if _warp_proc.poll() is not None:
+            raise RuntimeError("wireproxy сразу завершился")
+
+        proxy = f"socks5h://127.0.0.1:{WARP_PORT}"
+        found = warp_selftest(proxy)
+        if found > 0:
+            WARP_PROXY = proxy
+            YT_BLOCKED_UNTIL = 0.0  # раз YouTube отвечает через WARP, снимаем блокировку
+            WARP_STATUS = f"работает (тестовый поиск на YouTube: {found} рез.)"
+        else:
+            WARP_STATUS = "запущен, но YouTube через него не отвечает"
+            _warp_proc.terminate()
+        logging.info(f"WARP: {WARP_STATUS}")
+    except (Exception, SystemExit) as e:
+        WARP_STATUS = f"не удалось запустить: {str(e)[:200]}"
+        logging.warning(f"WARP: {WARP_STATUS}")
+
+
+def use_warp(opts, is_youtube):
+    """Добавляет прокси в настройки yt-dlp, но только для запросов к YouTube."""
+    global WARP_PROXY, WARP_STATUS
+    if WARP_PROXY and _warp_proc is not None and _warp_proc.poll() is not None:
+        WARP_PROXY = None
+        WARP_STATUS = "процесс WARP остановился"
+        logging.warning("WARP: процесс остановился, YouTube снова идёт напрямую")
+    if is_youtube and WARP_PROXY:
+        opts["proxy"] = WARP_PROXY
+    return opts
 
 
 def with_retry(fn, *args, tries=4, delay=3):
@@ -362,6 +505,25 @@ def yandex_track_info(short_track):
 
 
 # ---------- умный поиск аудио ----------
+TRANSLIT_READ = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sch", "ъ": "",
+    "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+}
+
+
+def translit_text(text):
+    """Читаемая латиница для русского текста; None, если в тексте нет кириллицы."""
+    low = (text or "").lower()
+    if not re.search(r"[а-яё]", low):
+        return None
+    out = "".join(TRANSLIT_READ.get(ch, ch) for ch in low)
+    return re.sub(r"\s+", " ", out).strip()
+
+
+
 def squash(text):
     """Слитное написание без пробелов и знаков: 'Bruno Mars' и 'brunomars' становятся одинаковыми."""
     return skeleton(re.sub(r"[\W_]+", "", (text or "").lower()))
@@ -450,6 +612,7 @@ def search_candidates(query, artist_words, first_artist_words, title_core_words,
     opts["ignore_no_formats_error"] = True
     if query.startswith("ytsearch"):
         opts["extract_flat"] = True  # быстро и без проверки форматов каждого видео
+        use_warp(opts, True)
     strict, relaxed = [], []
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -527,6 +690,7 @@ def download_url(url):
     if COOKIE_FILE:
         opts["cookiefile"] = COOKIE_FILE
     opts.update(JS_OPTS)
+    use_warp(opts, is_youtube)
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -563,12 +727,20 @@ def download_track_public(artists, title, orig_duration=None, allow_relaxed=True
     # варианты запроса без повторов; SoundCloud сейчас основной рабочий источник,
     # поэтому для него пробуем три формулировки
     query_texts = []
-    for text in (
+    variants = [
         f"{artists} - {title}",
         f"{first_artist} - {title_core}",
-        f"{title_core} {first_artist}",
-    ):
-        if text not in query_texts:
+    ]
+    # на SoundCloud русские исполнители часто подписаны латиницей
+    latin_variant = translit_text(f"{first_artist} {title_core}")
+    if latin_variant:
+        variants.append(latin_variant)
+    variants.append(f"{title_core} {first_artist}")
+    # только название: исполнителя всё равно проверяет оценка результата
+    if len(title_core) >= 5:
+        variants.append(title_core)
+    for text in variants:
+        if text and text not in query_texts:
             query_texts.append(text)
 
     # для YouTube второй запрос выводит автоматические «Topic»-каналы с оригиналами
@@ -664,6 +836,7 @@ def run_diagnostics(query):
     lines.append(f"yt-dlp: версия {version}")
     lines.append(f"JS-движок: {'подключён' if JS_OPTS else 'НЕ подключён'}")
     lines.append(f"Cookies: {'есть' if COOKIE_FILE else 'нет'}")
+    lines.append(f"WARP-прокси для YouTube: {WARP_STATUS}")
     lines.append(f"YouTube помечен как заблокированный: {'да' if yt_is_blocked() else 'нет'}")
     lines.append(f"Запрос: {query}")
     lines.append("")
@@ -680,6 +853,7 @@ def run_diagnostics(query):
     }
     if COOKIE_FILE:
         opts["cookiefile"] = COOKIE_FILE
+    use_warp(opts, True)
     entries = []
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -711,6 +885,7 @@ def run_diagnostics(query):
         if COOKIE_FILE:
             o2["cookiefile"] = COOKIE_FILE
         o2.update(JS_OPTS)
+        use_warp(o2, True)
         try:
             with yt_dlp.YoutubeDL(o2) as ydl:
                 inf = ydl.extract_info(url, download=False)
@@ -1381,6 +1556,8 @@ async def setup_bot_profile():
 async def main():
     asyncio.create_task(start_web_server())
     await asyncio.to_thread(ensure_js_runtime)
+    # WARP запускается в фоне, чтобы бот отвечал сразу
+    asyncio.create_task(asyncio.to_thread(ensure_warp))
     await bot.delete_webhook(drop_pending_updates=True)
     await setup_bot_profile()
     logging.info("Polling started")
