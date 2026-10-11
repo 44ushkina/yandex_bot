@@ -1,13 +1,25 @@
 import os
 import re
+import io
+import html
 import asyncio
 import difflib
 import logging
 
 from aiohttp import web
-from aiogram import Bot, Dispatcher
-from aiogram.types import Message, FSInputFile
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.filters import Command
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    FSInputFile,
+    BufferedInputFile,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    BotCommand,
+)
 from yandex_music import Client
 import yt_dlp
 
@@ -16,9 +28,10 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("Не найден BOT_TOKEN в переменных окружения Render.")
+# Токен Яндекса нужен только для чтения публичных плейлистов
 YANDEX_TOKEN = os.environ.get("YANDEX_TOKEN", "")
 
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 DOWNLOAD_DIR = "downloads"
@@ -27,18 +40,20 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 # ---------- настройки (можно менять) ----------
 
 # Идеальная разница длительности (в секундах) между Яндексом и найденным файлом.
-# Такие файлы бот берёт в первую очередь.
 MAX_DURATION_DIFF = 7
 
-# Запасной вариант: если идеальных не нашлось, бот берёт файл с разницей до этого значения,
-# но подписывает его предупреждением. Так находится больше треков.
+# Запасной вариант: файлы с разницей до этого значения берутся, если идеальных нет,
+# и подписываются предупреждением.
 RELAXED_DURATION_DIFF = 40
 
-# Сколько треков предлагать в подсказке следующей части
+# Размер одной части при переносе частями
 PART_SIZE = 100
 
-# True: №1 в списке «Мне нравится» = самый первый (старый) лайк
+# True: в плейлисте «Мне нравится» №1 = самый первый (старый) лайк
 LIKES_OLDEST_FIRST = True
+
+# Если в итоге список проблемных треков длиннее этого числа, он отправляется файлом
+MAX_INLINE_LIST = 10
 
 
 # ---------- нормализация текста для сравнения названий ----------
@@ -118,18 +133,21 @@ async def start_web_server():
 
 
 # ---------- Яндекс Музыка (синхронные функции, вызываются через to_thread) ----------
-def yandex_get_liked(token):
-    client = Client(token).init()
-    tracks = list(client.users_likes_tracks().tracks)
-    if LIKES_OLDEST_FIRST:
-        tracks.reverse()
-    return tracks
-
-
 def yandex_get_playlist(token, user_login, kind):
-    client = Client(token).init()
-    playlist = client.users_playlists(int(kind), user_login)
-    return playlist.tracks
+    """Возвращает (название плейлиста, список треков)."""
+    client = Client(token).init() if token else Client().init()
+    kind = int(kind)
+    playlist = client.users_playlists(kind, user_login)
+    if isinstance(playlist, list):
+        playlist = playlist[0]
+    tracks = list(playlist.tracks or [])
+    if not tracks:
+        tracks = list(playlist.fetch_tracks() or [])
+    title = getattr(playlist, "title", None) or "Плейлист"
+    # «Мне нравится» (kind=3): Яндекс отдаёт от новых к старым, разворачиваем
+    if kind == 3 and LIKES_OLDEST_FIRST:
+        tracks.reverse()
+    return title, tracks
 
 
 def yandex_track_info(short_track):
@@ -174,8 +192,9 @@ def score_entry(entry, artist_words, title_core_words, title_full_words):
 
 def search_candidates(query, artist_words, title_core_words, title_full_words, orig_duration):
     """
-    Ищет по запросу. Возвращает два списка кандидатов вида (оценка, разница_длительности, результат):
-    точные (длительность почти совпадает) и запасные (длительность отличается заметнее).
+    Ищет по запросу. Возвращает два списка кандидатов:
+    точные (оценка, разница_длительности, результат) и
+    запасные (оценка, разница_длительности, результат, причина, есть_пометка_ремикса).
     """
     opts = {
         "quiet": True,
@@ -303,7 +322,7 @@ def download_track_public(artists, title, orig_duration=None):
                 if path:
                     return path, None
 
-    # запасной вариант: файлы с заметной разницей длительности
+    # запасной вариант: файлы с заметной разницей длительности или пометкой ремикса
     pool = sorted(relaxed_pool.values(), key=lambda c: (c[4], c[1], -c[0]))
     for score, diff, entry, reason, is_bad in pool[:3]:
         url = entry.get("webpage_url") or entry.get("url")
@@ -315,18 +334,16 @@ def download_track_public(artists, title, orig_duration=None):
     return None, None
 
 
-# ---------- выбор части плейлиста ----------
+# ---------- разбор диапазона ----------
 def parse_selection(arg_text, total):
     """
-    Разбирает, какие треки обрабатывать. Возвращает (начало, конец), нумерация с 1,
-    или None, если запись непонятна.
-      пусто    -> все треки
-      "5"      -> первые 5 треков (для проверки)
+    Возвращает (начало, конец), нумерация с 1, или None, если запись непонятна.
+      "5"      -> первые 5 треков
       "1-100"  -> треки с 1-го по 100-й
     """
     arg_text = (arg_text or "").strip()
     if not arg_text:
-        return 1, total
+        return None
 
     match = re.fullmatch(r"(\d+)\s*-\s*(\d+)", arg_text)
     if match:
@@ -342,138 +359,493 @@ def parse_selection(arg_text, total):
     return start, end
 
 
-# ---------- общая логика переноса ----------
-async def transfer(message: Message, all_tracks, start, end, command_name, extra_args=""):
-    total_all = len(all_tracks)
-    selected = all_tracks[start - 1:end]
-    count = len(selected)
+# ---------- тексты интерфейса ----------
+MENU_TEXT = (
+    "👋 <b>Привет!</b>\n\n"
+    "Я переношу плейлисты из Яндекс Музыки в Telegram: название, исполнитель, "
+    "обложка и сам трек.\n\n"
+    "<b>Как начать</b>\n"
+    "Просто отправьте мне ссылку на плейлист, например:\n"
+    "<code>music.yandex.ru/users/ЛОГИН/playlists/НОМЕР</code>\n\n"
+    "Нужна помощь со ссылкой? Загляните в раздел «Помощь» ниже 👇"
+)
 
-    hours = round(count * 60 / 3600, 1)
-    await message.answer(
-        f"Всего в плейлисте: {total_all}. В работе: с {start} по {end} ({count} шт.).\n"
-        f"Примерное время: около {hours} ч. Одно сообщение с прогрессом будет обновляться."
+INFO_TEXTS = {
+    "how": (
+        "📖 <b>Как это работает</b>\n\n"
+        "1️⃣ Вы присылаете ссылку на открытый плейлист Яндекс Музыки.\n"
+        "2️⃣ Бот читает список: названия, исполнителей, обложки.\n"
+        "3️⃣ Для каждого трека бот ищет лучшую версию на открытых музыкальных площадках.\n"
+        "4️⃣ Готовые треки с обложками приходят вам в этот чат.\n\n"
+        "Качество звука: MP3, 192 кбит/с. Используйте бот только для личного архива."
+    ),
+    "time": (
+        "⏱ <b>Время и работа в фоне</b>\n\n"
+        "Перенос большого плейлиста занимает много времени: в среднем около минуты на трек. "
+        "100 треков это примерно 1,5–2 часа.\n\n"
+        "🌙 <b>Бот работает на сервере.</b> Нажмите «Перенести», затем можно закрыть Telegram "
+        "или выключить телефон: треки будут приходить в чат сами, а когда вы вернётесь, всё уже будет на месте.\n\n"
+        "📦 Для больших плейлистов удобнее переносить <b>частями по 100 треков</b>: "
+        "после каждой части бот предложит следующую одной кнопкой.\n\n"
+        "⏹ Остановить перенос можно в любой момент кнопкой или командой /stop."
+    ),
+    "search": (
+        "🔎 <b>О поиске</b>\n\n"
+        "Бот не берёт первый попавшийся файл. Он сравнивает название, исполнителя и длительность, "
+        "чтобы найти именно оригинал, а не ремикс, кавер или ускоренную версию.\n\n"
+        "Поэтому поиск редких или малоизвестных треков может занимать несколько минут: "
+        "бот пробует разные варианты запроса и разные площадки, чтобы выбрать лучшую версию.\n\n"
+        "⚠️ Если точной версии нет, бот может прислать похожую, но обязательно подпишет это под треком. "
+        "Список таких случаев будет в итоговом сообщении."
+    ),
+    "help": (
+        "❓ <b>Помощь</b>\n\n"
+        "<b>Где взять ссылку?</b>\n"
+        "Откройте плейлист в Яндекс Музыке в браузере и скопируйте адрес из адресной строки. "
+        "Он должен выглядеть так:\n"
+        "<code>music.yandex.ru/users/ЛОГИН/playlists/НОМЕР</code>\n\n"
+        "<b>«Мне нравится»</b>\n"
+        "Ссылка заканчивается на <code>/playlists/3</code>. В настройках приватности "
+        "Яндекс Музыки плейлисты должны быть открыты.\n\n"
+        "<b>Бот пишет, что не может открыть плейлист</b>\n"
+        "Скорее всего, плейлист закрыт для посторонних. Откройте доступ и отправьте ссылку снова.\n\n"
+        "<b>Команды</b>\n"
+        "/start — главное меню\n"
+        "/stop — остановить перенос\n"
+        "/help — эта справка"
+    ),
+}
+
+
+# ---------- кнопки ----------
+def btn(text, data):
+    return InlineKeyboardButton(text=text, callback_data=data)
+
+
+def kb(*rows):
+    return InlineKeyboardMarkup(inline_keyboard=[list(r) for r in rows])
+
+
+def menu_kb():
+    return kb(
+        [btn("📖 Как это работает", "info:how:menu"), btn("⏱ Время и фон", "info:time:menu")],
+        [btn("🔎 О поиске", "info:search:menu"), btn("❓ Помощь", "info:help:menu")],
     )
-    progress = await message.answer("Начинаю...")
+
+
+def fmt_time(count):
+    minutes = count
+    if minutes < 60:
+        return f"около {int(minutes)} мин"
+    return f"около {minutes / 60:.1f} ч"
+
+
+def card_text(session):
+    return (
+        f"📀 <b>{html.escape(session['title'])}</b>\n"
+        f"🎵 Треков: <b>{session['total']}</b>\n"
+        f"⏱ Весь плейлист: {fmt_time(session['total'])}\n\n"
+        "Как переносить?\n"
+        "• <b>Частями</b> — удобнее для больших плейлистов\n"
+        "• <b>Сразу всё</b> — бот работает на сервере, можно закрыть Telegram\n\n"
+        "<i>Поиск лучшей версии каждого трека занимает время, это нормально 🙂</i>"
+    )
+
+
+def card_kb(session):
+    total = session["total"]
+    part_end = min(PART_SIZE, total)
+    test_end = min(5, total)
+    return kb(
+        [btn(f"📦 Частями: 1–{part_end}", f"run:1-{part_end}")],
+        [btn(f"▶️ Сразу всё ({total})", f"run:1-{total}")],
+        [btn("✏️ Свой диапазон", "custom"), btn(f"🧪 Проверка: {test_end}", f"run:1-{test_end}")],
+        [btn("⏱ Как долго?", "info:time:card"), btn("❌ Отмена", "cancel")],
+    )
+
+
+def back_kb(back):
+    return kb([btn("⬅️ Назад", f"back:{back}")])
+
+
+STOP_KB = kb([btn("⏹ Остановить", "stop")])
+
+
+def progress_bar(done, total, width=10):
+    if total <= 0:
+        return "░" * width
+    filled = int(width * done / total)
+    return "▓" * filled + "░" * (width - filled)
+
+
+# ---------- состояние ----------
+sessions = {}      # user_id -> данные о плейлисте
+active_jobs = {}   # user_id -> asyncio.Task
+stop_events = {}   # user_id -> asyncio.Event
+WORK_LOCK = asyncio.Lock()  # перенос идёт по одному плейлисту за раз
+queue_ids = []     # кто ждёт очереди
+
+LINK_RE = re.compile(
+    r"music\.yandex\.(?:ru|com|by|kz|uz)/users/([^/\s?#]+)/playlists/(\d+)", re.IGNORECASE
+)
+
+
+# ---------- выполнение переноса ----------
+async def safe_edit(chat_id, message_id, text, reply_markup=None):
+    try:
+        await bot.edit_message_text(
+            text=text, chat_id=chat_id, message_id=message_id, reply_markup=reply_markup
+        )
+    except Exception:
+        pass
+
+
+async def run_job(chat_id, user_id, start, end):
+    session = sessions.get(user_id)
+    if not session:
+        await bot.send_message(chat_id, "Сессия устарела. Отправьте ссылку на плейлист заново.")
+        return
+
+    stop_event = stop_events[user_id]
+    selected = session["tracks"][start - 1:end]
+    count = len(selected)
+    total_all = session["total"]
+    title_escaped = html.escape(session["title"])
+
+    # --- очередь ---
+    if WORK_LOCK.locked():
+        queue_ids.append(user_id)
+        status = await bot.send_message(
+            chat_id,
+            f"⏳ Сейчас идёт перенос для другого пользователя.\n"
+            f"Вы в очереди, перед вами: <b>{len(queue_ids)}</b>.\n"
+            "Начну сам, как только освобожусь. Telegram можно закрыть.",
+            reply_markup=STOP_KB,
+        )
+    else:
+        status = await bot.send_message(chat_id, "🚀 Запускаю перенос...", reply_markup=STOP_KB)
 
     ok, failed, flagged = 0, [], []
-    for offset, short_track in enumerate(selected):
-        number = start + offset  # номер трека в плейлисте
-        cover = None
-        file_path = None
-        try:
-            title, artists, cover, duration = await asyncio.to_thread(yandex_track_info, short_track)
-            try:
-                await progress.edit_text(f"№{number} (до {end}): {artists} — {title}")
-            except Exception:
-                pass
+    last_done = start - 1
+    stopped = False
 
-            file_path, note = await asyncio.to_thread(download_track_public, artists, title, duration)
-            if file_path:
-                await message.answer_audio(
-                    audio=FSInputFile(file_path),
-                    title=title,
-                    performer=artists,
-                    thumbnail=FSInputFile(cover) if cover and os.path.exists(cover) else None,
-                    caption=f"⚠️ {note}" if note else None,
-                )
-                ok += 1
-                if note:
-                    flagged.append(f"№{number}: {artists} — {title} ({note})")
-            else:
-                failed.append(f"№{number}: {artists} — {title}")
-        except Exception as e:
-            logging.exception("Ошибка на треке")
-            failed.append(f"№{number}: ошибка ({e})")
-        finally:
-            for p in (file_path, cover):
-                if p and os.path.exists(p):
-                    os.remove(p)
+    try:
+        async with WORK_LOCK:
+            if user_id in queue_ids:
+                queue_ids.remove(user_id)
 
-        # пауза, чтобы Telegram не ограничил бота за частые отправки
-        await asyncio.sleep(3)
-        if (offset + 1) % 5 == 0:
-            await asyncio.sleep(10)
+            for offset, short_track in enumerate(selected):
+                if stop_event.is_set():
+                    stopped = True
+                    break
 
-    report = f"Готово: треки с {start} по {end}. Загружено: {ok} из {count}."
+                number = start + offset
+                cover = None
+                file_path = None
+                artists = title = ""
+                try:
+                    title, artists, cover, duration = await asyncio.to_thread(
+                        yandex_track_info, short_track
+                    )
+
+                    await safe_edit(
+                        chat_id,
+                        status.message_id,
+                        f"⏳ <b>Идёт перенос</b>\n"
+                        f"📀 {title_escaped}\n\n"
+                        f"{progress_bar(offset, count)} {int(100 * offset / count)}%\n"
+                        f"Трек <b>{number}</b> из {end} (часть {start}–{end})\n\n"
+                        f"🎵 {html.escape(artists)} — {html.escape(title)}\n\n"
+                        f"✅ Загружено: {ok}   🔍 Не найдено: {len(failed)}\n"
+                        "<i>Поиск лучшей версии может занимать несколько минут. "
+                        "Telegram можно закрыть.</i>",
+                        reply_markup=STOP_KB,
+                    )
+
+                    file_path, note = await asyncio.to_thread(
+                        download_track_public, artists, title, duration
+                    )
+                    if file_path:
+                        await bot.send_audio(
+                            chat_id,
+                            audio=FSInputFile(file_path),
+                            title=title,
+                            performer=artists,
+                            thumbnail=FSInputFile(cover) if cover and os.path.exists(cover) else None,
+                            caption=f"⚠️ {html.escape(note)}" if note else None,
+                        )
+                        ok += 1
+                        if note:
+                            flagged.append(f"№{number}: {artists} — {title} ({note})")
+                    else:
+                        failed.append(f"№{number}: {artists} — {title}")
+                except Exception as e:
+                    logging.exception("Ошибка на треке")
+                    failed.append(f"№{number}: {artists or 'трек'} {title} (ошибка: {e})")
+                finally:
+                    for p in (file_path, cover):
+                        if p and os.path.exists(p):
+                            os.remove(p)
+
+                last_done = number
+
+                # пауза, чтобы Telegram не ограничил бота за частые отправки
+                await asyncio.sleep(3)
+                if (offset + 1) % 5 == 0:
+                    await asyncio.sleep(10)
+    except Exception:
+        logging.exception("Сбой задачи переноса")
+    finally:
+        if user_id in queue_ids:
+            queue_ids.remove(user_id)
+
+    processed = last_done - start + 1
+
+    # --- итог ---
+    if stopped:
+        await safe_edit(chat_id, status.message_id, f"⏹ Перенос остановлен на треке №{last_done}.")
+        header = f"⏹ <b>Остановлено</b> на №{last_done}"
+    else:
+        await safe_edit(chat_id, status.message_id, f"✅ Часть {start}–{end} обработана.")
+        header = f"✅ <b>Часть {start}–{end} готова</b>"
+
+    lines = [header, f"🎵 Загружено: <b>{ok}</b> из {max(processed, 0)}"]
     if flagged:
-        report += "\n\nВозможно не та версия (проверьте на слух):\n" + "\n".join(flagged[:30])
+        lines.append(f"⚠️ Возможно другая версия: {len(flagged)}")
     if failed:
-        report += "\n\nНе удалось найти:\n" + "\n".join(failed[:40])
-        if len(failed) > 40:
-            report += f"\n...и ещё {len(failed) - 40}"
-    if end < total_all:
+        lines.append(f"🔍 Не найдено: {len(failed)}")
+
+    problem_lines = []
+    if flagged:
+        problem_lines.append("⚠️ Возможно не та версия (проверьте на слух):")
+        problem_lines.extend(flagged)
+    if failed:
+        if problem_lines:
+            problem_lines.append("")
+        problem_lines.append("🔍 Не найдено:")
+        problem_lines.extend(failed)
+
+    send_file = len(flagged) + len(failed) > MAX_INLINE_LIST
+    if problem_lines and not send_file:
+        lines.append("")
+        lines.extend(html.escape(x) for x in problem_lines)
+    if send_file:
+        lines.append("\n📎 Подробный список в файле ниже.")
+
+    rows = []
+    if stopped and last_done < end:
+        rows.append([btn(f"▶️ Продолжить с №{last_done + 1}", f"run:{last_done + 1}-{end}")])
+    elif end < total_all:
         next_start = end + 1
         next_end = min(end + PART_SIZE, total_all)
-        report += f"\n\nСледующая часть:\n/{command_name} {extra_args}{next_start}-{next_end}".replace("  ", " ")
+        rows.append([btn(f"➡️ Следующая часть {next_start}–{next_end}", f"run:{next_start}-{next_end}")])
     else:
-        report += "\n\nПлейлист закончился."
-    await message.answer(report)
+        lines.append("\n🎉 Плейлист закончился!")
+    rows.append([btn("🏠 Меню", "back:menu")])
+
+    await bot.send_message(chat_id, "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+    if send_file:
+        data = "\n".join(problem_lines).encode("utf-8")
+        await bot.send_document(
+            chat_id, BufferedInputFile(data, filename="report.txt"), caption="Список проблемных треков"
+        )
+
+
+async def start_job(chat_id, user_id, start, end):
+    task = active_jobs.get(user_id)
+    if task and not task.done():
+        await bot.send_message(chat_id, "⏳ Перенос уже идёт. Остановить его можно командой /stop.")
+        return
+    stop_events[user_id] = asyncio.Event()
+    active_jobs[user_id] = asyncio.create_task(run_job(chat_id, user_id, start, end))
 
 
 # ---------- команды ----------
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
+    await message.answer(MENU_TEXT, reply_markup=menu_kb())
+
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    await message.answer(INFO_TEXTS["help"], reply_markup=back_kb("menu"))
+
+
+@dp.message(Command("stop"))
+async def cmd_stop(message: Message):
+    user_id = message.from_user.id
+    task = active_jobs.get(user_id)
+    if task and not task.done():
+        stop_events[user_id].set()
+        await message.answer("⏹ Останавливаю после текущего трека...")
+    else:
+        await message.answer("Сейчас нет активного переноса.")
+
+
+# ---------- кнопки (callback) ----------
+@dp.callback_query()
+async def on_callback(cb: CallbackQuery):
+    data = cb.data or ""
+    user_id = cb.from_user.id
+    message = cb.message
+    await cb.answer()
+
+    async def show(text, markup):
+        try:
+            await message.edit_text(text, reply_markup=markup)
+        except Exception:
+            pass
+
+    if data.startswith("info:"):
+        _, key, back = data.split(":")
+        await show(INFO_TEXTS.get(key, "—"), back_kb(back))
+
+    elif data.startswith("back:"):
+        back = data.split(":")[1]
+        session = sessions.get(user_id)
+        if back == "card" and session:
+            await show(card_text(session), card_kb(session))
+        else:
+            await show(MENU_TEXT, menu_kb())
+
+    elif data.startswith("run:"):
+        session = sessions.get(user_id)
+        if not session:
+            await show("Сессия устарела. Отправьте ссылку на плейлист заново.", menu_kb())
+            return
+        start_s, end_s = data[4:].split("-")
+        start, end = int(start_s), min(int(end_s), session["total"])
+        if start < 1 or start > end:
+            return
+        try:
+            await message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await start_job(message.chat.id, user_id, start, end)
+
+    elif data == "custom":
+        session = sessions.get(user_id)
+        if not session:
+            await show("Сессия устарела. Отправьте ссылку на плейлист заново.", menu_kb())
+            return
+        session["awaiting_range"] = True
+        await show(
+            f"✏️ <b>Свой диапазон</b>\n\n"
+            f"В плейлисте {session['total']} треков. Отправьте номера, например:\n"
+            "<code>1-100</code> — с первого по сотый\n"
+            "<code>101-200</code> — со 101-го по 200-й\n"
+            "<code>10</code> — первые 10 треков",
+            kb([btn("⬅️ Назад", "back:card")]),
+        )
+
+    elif data == "stop":
+        task = active_jobs.get(user_id)
+        if task and not task.done():
+            stop_events[user_id].set()
+            await show("⏹ Останавливаю после текущего трека...", None)
+
+    elif data == "cancel":
+        sessions.pop(user_id, None)
+        await show(MENU_TEXT, menu_kb())
+
+
+# ---------- обработка ссылок и текста ----------
+async def handle_link(message: Message, login, kind):
+    user_id = message.from_user.id
+    wait = await message.answer("🔎 Открываю плейлист...")
+    try:
+        title, tracks = await asyncio.to_thread(yandex_get_playlist, YANDEX_TOKEN, login, kind)
+    except Exception as e:
+        logging.warning(f"Не удалось открыть плейлист {login}/{kind}: {e}")
+        await wait.edit_text(
+            "❌ <b>Не получилось открыть плейлист.</b>\n\n"
+            "Проверьте, что плейлист открыт для всех, а ссылка скопирована полностью. "
+            "Подробнее в «Помощь».",
+            reply_markup=kb([btn("❓ Помощь", "info:help:menu")]),
+        )
+        return
+
+    if not tracks:
+        await wait.edit_text("В этом плейлисте нет треков или он закрыт.")
+        return
+
+    sessions[user_id] = {
+        "title": title,
+        "tracks": tracks,
+        "total": len(tracks),
+        "awaiting_range": False,
+    }
+    session = sessions[user_id]
+    await wait.edit_text(card_text(session), reply_markup=card_kb(session))
+
+
+@dp.message(F.text)
+async def on_text(message: Message):
+    user_id = message.from_user.id
+    text = message.text.strip()
+
+    match = LINK_RE.search(text)
+    if match:
+        await handle_link(message, match.group(1), match.group(2))
+        return
+
+    if "music.yandex" in text.lower():
+        await message.answer(
+            "🤔 Не вижу в ссылке логин и номер плейлиста.\n\n"
+            "Откройте плейлист в браузере и скопируйте адрес из адресной строки. "
+            "Он должен выглядеть так:\n"
+            "<code>music.yandex.ru/users/ЛОГИН/playlists/НОМЕР</code>",
+            reply_markup=kb([btn("❓ Помощь", "info:help:menu")]),
+        )
+        return
+
+    session = sessions.get(user_id)
+    if session and session.get("awaiting_range"):
+        selection = parse_selection(text, session["total"])
+        if selection is None:
+            await message.answer(
+                f"Не поняла диапазон. В плейлисте {session['total']} треков.\n"
+                "Пример: <code>1-100</code>"
+            )
+            return
+        session["awaiting_range"] = False
+        await start_job(message.chat.id, user_id, selection[0], selection[1])
+        return
+
     await message.answer(
-        "Привет! Я переношу треки из Яндекс Музыки в Telegram.\n\n"
-        "/download — весь плейлист «Мне нравится»\n"
-        "/download 3 — первые 3 трека (для проверки)\n"
-        "/download 1-100 — треки с 1-го по 100-й (перенос частями)\n\n"
-        "/playlist логин номер — публичный плейлист целиком\n"
-        "/playlist логин номер 1-100 — часть плейлиста\n"
-        "Ссылка плейлиста: music.yandex.ru/users/ЛОГИН/playlists/НОМЕР"
+        "Отправьте ссылку на плейлист из Яндекс Музыки или откройте меню 👇",
+        reply_markup=kb([btn("🏠 Меню", "back:menu")]),
     )
 
 
-@dp.message(Command("download"))
-async def cmd_download(message: Message):
-    if not YANDEX_TOKEN:
-        await message.answer("Не задан YANDEX_TOKEN в Render.")
-        return
-    args = message.text.split()
-    arg_text = " ".join(args[1:])
+async def setup_bot_profile():
+    """Меню команд и описание бота (то, что люди видят в Telegram)."""
     try:
-        await message.answer("Получаю список «Мне нравится»...")
-        tracks = await asyncio.to_thread(yandex_get_liked, YANDEX_TOKEN)
-        selection = parse_selection(arg_text, len(tracks))
-        if selection is None:
-            await message.answer(
-                f"Не поняла диапазон. В плейлисте {len(tracks)} треков. "
-                "Примеры: /download 5 или /download 1-100"
+        await bot.set_my_commands(
+            [
+                BotCommand(command="start", description="Главное меню"),
+                BotCommand(command="help", description="Помощь и как получить ссылку"),
+                BotCommand(command="stop", description="Остановить перенос"),
+            ]
+        )
+        await bot.set_my_short_description(
+            short_description="Перенос плейлистов из Яндекс Музыки в Telegram"
+        )
+        await bot.set_my_description(
+            description=(
+                "Переношу плейлисты из Яндекс Музыки в Telegram: название, исполнитель, обложка и трек. "
+                "Отправьте ссылку на плейлист, и я пришлю музыку в этот чат."
             )
-            return
-        start, end = selection
-        await transfer(message, tracks, start, end, "download")
+        )
     except Exception as e:
-        await message.answer(f"Ошибка при работе с Яндекс Музыкой: {e}")
-
-
-@dp.message(Command("playlist"))
-async def cmd_playlist(message: Message):
-    args = message.text.split()
-    if len(args) < 3 or not args[2].isdigit():
-        await message.answer("Формат: /playlist логин номер [5 или 1-100]")
-        return
-    login, kind = args[1], args[2]
-    arg_text = " ".join(args[3:])
-    try:
-        await message.answer("Получаю плейлист...")
-        tracks = await asyncio.to_thread(yandex_get_playlist, YANDEX_TOKEN, login, kind)
-        selection = parse_selection(arg_text, len(tracks))
-        if selection is None:
-            await message.answer(
-                f"Не поняла диапазон. В плейлисте {len(tracks)} треков. "
-                f"Примеры: /playlist {login} {kind} 5 или /playlist {login} {kind} 1-100"
-            )
-            return
-        start, end = selection
-        await transfer(message, tracks, start, end, "playlist", extra_args=f"{login} {kind} ")
-    except Exception as e:
-        await message.answer(f"Ошибка при получении плейлиста: {e}")
+        logging.warning(f"Не удалось настроить профиль бота: {e}")
 
 
 async def main():
     asyncio.create_task(start_web_server())
     await bot.delete_webhook(drop_pending_updates=True)
+    await setup_bot_profile()
     logging.info("Polling started")
     await dp.start_polling(bot)
 
