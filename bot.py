@@ -1,6 +1,7 @@
 import os
 import re
 import asyncio
+import difflib
 import logging
 
 from aiohttp import web
@@ -23,21 +24,82 @@ dp = Dispatcher()
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# Максимально допустимая разница длительности (в секундах) между оригиналом
-# из Яндекса и найденным файлом. Чем меньше число, тем строже отбор:
-# меньше ускоренных/замедленных версий, но и меньше найденных треков.
+# ---------- настройки (можно менять) ----------
+
+# Идеальная разница длительности (в секундах) между Яндексом и найденным файлом.
+# Такие файлы бот берёт в первую очередь.
 MAX_DURATION_DIFF = 7
 
-# Сколько треков обрабатывать в одной части, если подсказывать следующую команду
+# Запасной вариант: если идеальных не нашлось, бот берёт файл с разницей до этого значения,
+# но подписывает его предупреждением. Так находится больше треков.
+RELAXED_DURATION_DIFF = 40
+
+# Сколько треков предлагать в подсказке следующей части
 PART_SIZE = 100
 
-# Слова, которые обычно означают "не оригинал"
-BAD_WORDS = {
-    "remix", "cover", "slowed", "reverb", "sped", "speed", "speedup", "spedup",
-    "nightcore", "karaoke", "instrumental", "mashup", "8d", "boosted",
-    "ремикс", "кавер", "минус", "караоке",
-    "ускоренный", "ускоренная", "ускорено", "ускорен", "замедленный", "замедленная",
+# True: №1 в списке «Мне нравится» = самый первый (старый) лайк
+LIKES_OLDEST_FIRST = True
+
+
+# ---------- нормализация текста для сравнения названий ----------
+TRANSLIT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "i", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "h", "ц": "c", "ч": "ch", "ш": "sh", "щ": "sh", "ъ": "",
+    "ы": "i", "ь": "", "э": "e", "ю": "u", "я": "a",
 }
+
+SKELETON_REPLACEMENTS = [
+    ("kh", "h"), ("ts", "c"), ("zh", "z"), ("sh", "s"), ("ch", "c"),
+    ("ya", "a"), ("yu", "u"), ("ye", "e"), ("yo", "e"),
+    ("y", "i"), ("j", "i"), ("w", "v"), ("x", "ks"), ("q", "k"),
+]
+
+
+def skeleton(word):
+    """Приводит слово к упрощённому латинскому виду, чтобы сравнивать русский и английский."""
+    word = "".join(TRANSLIT.get(ch, ch) for ch in word)
+    for a, b in SKELETON_REPLACEMENTS:
+        word = word.replace(a, b)
+    word = re.sub(r"(.)\1+", r"\1", word)
+    return word
+
+
+def norm_words(text):
+    """Множество упрощённых слов из текста."""
+    if not text:
+        return set()
+    text = text.lower().replace("_", " ")
+    text = re.sub(r"[^\w\s]", " ", text)
+    # разделяем буквы и цифры: "100iz10" -> "100 iz 10"
+    text = re.sub(r"(?<=\d)(?=[^\W\d_])|(?<=[^\W\d_])(?=\d)", " ", text)
+    return {skeleton(w) for w in text.split()}
+
+
+def fuzzy_overlap(query_words, found_words):
+    """Доля слов запроса, которые есть среди найденных (с учётом небольших отличий в написании)."""
+    if not query_words:
+        return 0.0
+    hits = 0
+    for qw in query_words:
+        if qw in found_words:
+            hits += 1
+            continue
+        if len(qw) >= 4:
+            for fw in found_words:
+                if difflib.SequenceMatcher(None, qw, fw).ratio() >= 0.8:
+                    hits += 1
+                    break
+    return hits / len(query_words)
+
+
+# Слова, которые обычно означают "не оригинал"
+BAD_WORDS = norm_words(
+    "remix cover slowed reverb sped speed speedup spedup nightcore karaoke "
+    "instrumental mashup boosted ремикс кавер минус караоке "
+    "ускоренный ускоренная ускорено ускорен замедленный замедленная"
+)
 
 
 # ---------- веб-сервер, чтобы Render видел открытый порт ----------
@@ -58,7 +120,10 @@ async def start_web_server():
 # ---------- Яндекс Музыка (синхронные функции, вызываются через to_thread) ----------
 def yandex_get_liked(token):
     client = Client(token).init()
-    return client.users_likes_tracks().tracks
+    tracks = list(client.users_likes_tracks().tracks)
+    if LIKES_OLDEST_FIRST:
+        tracks.reverse()
+    return tracks
 
 
 def yandex_get_playlist(token, user_login, kind):
@@ -85,59 +150,42 @@ def yandex_track_info(short_track):
 
 
 # ---------- умный поиск аудио ----------
-def norm_words(text):
-    """Разбивает текст на множество слов (маленькими буквами, без знаков)."""
-    if not text:
-        return set()
-    return set(re.sub(r"[^\w\s]", " ", text.lower()).split())
-
-
-def score_entry(entry, artist_words, title_words, orig_duration):
+def score_entry(entry, artist_words, title_core_words, title_full_words):
     """Оценка того, насколько найденный результат похож на нужный трек."""
     found_title = entry.get("title") or ""
     uploader = entry.get("uploader") or entry.get("channel") or ""
     found_words = norm_words(found_title + " " + uploader)
 
-    if title_words:
-        title_part = len(title_words & found_words) / len(title_words)
-    else:
-        title_part = 0.0
-    if artist_words:
-        artist_part = len(artist_words & found_words) / len(artist_words)
-    else:
-        artist_part = 0.0
+    title_part = fuzzy_overlap(title_core_words, found_words)
+    artist_part = fuzzy_overlap(artist_words, found_words)
 
     score = title_part * 2 + artist_part
 
     # штраф за ремиксы, каверы, ускоренные версии и т.п.,
-    # если этого слова нет в оригинальном названии
-    found_title_words = norm_words(found_title)
-    bad = (found_title_words & BAD_WORDS) - title_words
+    # если такого слова нет в оригинальном названии
+    bad = (norm_words(found_title) & BAD_WORDS) - title_full_words
     score -= 0.7 * len(bad)
-
-    # бонус за точное совпадение длительности
-    found_duration = entry.get("duration")
-    if found_duration and orig_duration:
-        if abs(found_duration - orig_duration) <= 3:
-            score += 0.5
 
     return score, title_part
 
 
-def search_candidates(query, artist_words, title_words, orig_duration):
-    """Ищет по запросу и возвращает список (оценка, результат), лучшие первыми."""
+def search_candidates(query, artist_words, title_core_words, title_full_words, orig_duration):
+    """
+    Ищет по запросу. Возвращает два списка кандидатов вида (оценка, разница_длительности, результат):
+    точные (длительность почти совпадает) и запасные (длительность отличается заметнее).
+    """
     opts = {
         "quiet": True,
         "no_warnings": True,
         "ignoreerrors": True,
         "skip_download": True,
     }
-    result = []
+    strict, relaxed = [], []
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(query, download=False)
         if not info:
-            return result
+            return strict, relaxed
         for entry in info.get("entries") or []:
             if not entry:
                 continue
@@ -145,25 +193,31 @@ def search_candidates(query, artist_words, title_words, orig_duration):
             if found_duration and found_duration > 600:
                 continue  # слишком длинное: микс, альбом целиком
 
-            # строгая проверка длительности
+            diff = None
             if found_duration and orig_duration:
                 diff = abs(found_duration - orig_duration)
-                if diff > MAX_DURATION_DIFF:
+                if diff > RELAXED_DURATION_DIFF:
                     logging.info(
                         f"   отброшен: '{entry.get('title')}' длительность отличается на {diff:.0f} с"
                     )
                     continue
 
-            score, title_part = score_entry(entry, artist_words, title_words, orig_duration)
+            score, title_part = score_entry(entry, artist_words, title_core_words, title_full_words)
+            if diff is not None and diff <= 3:
+                score += 0.5
             logging.info(
-                f"   кандидат: '{entry.get('title')}' оценка={score:.2f} совпадение названия={title_part:.2f}"
+                f"   кандидат: '{entry.get('title')}' оценка={score:.2f} "
+                f"название={title_part:.2f} разница={diff}"
             )
             if title_part >= 0.6 and score >= 2.0:
-                result.append((score, entry))
+                if diff is not None and diff > MAX_DURATION_DIFF:
+                    relaxed.append((score, diff, entry))
+                else:
+                    strict.append((score, diff or 0, entry))
     except Exception as e:
         logging.warning(f"Ошибка поиска '{query}': {e}")
-    result.sort(key=lambda x: x[0], reverse=True)
-    return result
+    strict.sort(key=lambda x: x[0], reverse=True)
+    return strict, relaxed
 
 
 def download_url(url):
@@ -192,35 +246,66 @@ def download_url(url):
 
 
 def download_track_public(artists, title, orig_duration=None):
-    """Главная функция: ищет лучший вариант трека и скачивает его."""
+    """
+    Главная функция: ищет лучший вариант трека и скачивает его.
+    Возвращает (путь к файлу или None, предупреждение или None).
+    """
     logging.info(f"Ищу: {artists} — {title} (длительность {orig_duration})")
     first_artist = artists.split(",")[0].strip()
+
+    # название без скобок: "Трек (feat. Кто-то)" -> "Трек"
+    title_core = re.sub(r"[\(\[].*?[\)\]]", " ", title).strip()
+    if not title_core:
+        title_core = title
+
     artist_words = norm_words(artists)
-    title_words = norm_words(title)
+    title_core_words = norm_words(title_core)
+    title_full_words = norm_words(title)
 
-    # варианты запроса: от самого точного к более простым
-    query_texts = [f"{artists} - {title}"]
-    if first_artist and first_artist != artists:
-        query_texts.append(f"{first_artist} - {title}")
-    query_texts.append(f"{title} {first_artist}")
+    # варианты запроса: от самого точного к более простым (без повторов)
+    query_texts = []
+    for text in (
+        f"{artists} - {title}",
+        f"{first_artist} - {title_core}",
+        f"{title_core} {first_artist}",
+    ):
+        if text not in query_texts:
+            query_texts.append(text)
 
-    sources = ["scsearch5", "ytsearch5"]
+    sources = ["scsearch8", "ytsearch5"]
+    relaxed_pool = {}
 
     for source in sources:
         for text in query_texts:
             query = f"{source}:{text}"
             logging.info(f"Запрос: {query}")
-            candidates = search_candidates(query, artist_words, title_words, orig_duration)
-            # пробуем скачать до 3 лучших результатов
-            for score, entry in candidates[:3]:
+            strict, relaxed = search_candidates(
+                query, artist_words, title_core_words, title_full_words, orig_duration
+            )
+            for cand in relaxed:
+                url = cand[2].get("webpage_url") or cand[2].get("url")
+                if url and url not in relaxed_pool:
+                    relaxed_pool[url] = cand
+            # пробуем скачать до 3 лучших точных результатов
+            for score, diff, entry in strict[:3]:
                 url = entry.get("webpage_url") or entry.get("url")
                 if not url:
                     continue
                 logging.info(f"Выбран: '{entry.get('title')}' (оценка {score:.2f})")
                 path = download_url(url)
                 if path:
-                    return path
-    return None
+                    return path, None
+
+    # запасной вариант: файлы с заметной разницей длительности
+    pool = sorted(relaxed_pool.values(), key=lambda c: (c[1], -c[0]))
+    for score, diff, entry in pool[:3]:
+        url = entry.get("webpage_url") or entry.get("url")
+        logging.info(f"Запасной вариант: '{entry.get('title')}' (разница {diff:.0f} с)")
+        path = download_url(url)
+        if path:
+            return path, f"длительность отличается от Яндекса на {diff:.0f} с, возможно другая версия"
+
+    return None, None
 
 
 # ---------- выбор части плейлиста ----------
@@ -229,7 +314,7 @@ def parse_selection(arg_text, total):
     Разбирает, какие треки обрабатывать. Возвращает (начало, конец), нумерация с 1,
     или None, если запись непонятна.
       пусто    -> все треки
-      "5"      -> последние 5 треков списка (для проверки)
+      "5"      -> первые 5 треков (для проверки)
       "1-100"  -> треки с 1-го по 100-й
     """
     arg_text = (arg_text or "").strip()
@@ -240,8 +325,7 @@ def parse_selection(arg_text, total):
     if match:
         start, end = int(match.group(1)), int(match.group(2))
     elif arg_text.isdigit():
-        n = int(arg_text)
-        start, end = max(1, total - n + 1), total
+        start, end = 1, int(arg_text)
     else:
         return None
 
@@ -257,14 +341,14 @@ async def transfer(message: Message, all_tracks, start, end, command_name, extra
     selected = all_tracks[start - 1:end]
     count = len(selected)
 
-    hours = round(count * 30 / 3600, 1)
+    hours = round(count * 60 / 3600, 1)
     await message.answer(
         f"Всего в плейлисте: {total_all}. В работе: с {start} по {end} ({count} шт.).\n"
-        f"Примерное время: {hours} ч. Одно сообщение с прогрессом будет обновляться."
+        f"Примерное время: около {hours} ч. Одно сообщение с прогрессом будет обновляться."
     )
     progress = await message.answer("Начинаю...")
 
-    ok, failed = 0, []
+    ok, failed, flagged = 0, [], []
     for offset, short_track in enumerate(selected):
         number = start + offset  # номер трека в плейлисте
         cover = None
@@ -276,15 +360,18 @@ async def transfer(message: Message, all_tracks, start, end, command_name, extra
             except Exception:
                 pass
 
-            file_path = await asyncio.to_thread(download_track_public, artists, title, duration)
+            file_path, note = await asyncio.to_thread(download_track_public, artists, title, duration)
             if file_path:
                 await message.answer_audio(
                     audio=FSInputFile(file_path),
                     title=title,
                     performer=artists,
                     thumbnail=FSInputFile(cover) if cover and os.path.exists(cover) else None,
+                    caption=f"⚠️ {note}" if note else None,
                 )
                 ok += 1
+                if note:
+                    flagged.append(f"№{number}: {artists} — {title} ({note})")
             else:
                 failed.append(f"№{number}: {artists} — {title}")
         except Exception as e:
@@ -301,6 +388,8 @@ async def transfer(message: Message, all_tracks, start, end, command_name, extra
             await asyncio.sleep(10)
 
     report = f"Готово: треки с {start} по {end}. Загружено: {ok} из {count}."
+    if flagged:
+        report += "\n\nВозможно не та версия (проверьте на слух):\n" + "\n".join(flagged[:30])
     if failed:
         report += "\n\nНе удалось найти:\n" + "\n".join(failed[:40])
         if len(failed) > 40:
@@ -320,7 +409,7 @@ async def cmd_start(message: Message):
     await message.answer(
         "Привет! Я переношу треки из Яндекс Музыки в Telegram.\n\n"
         "/download — весь плейлист «Мне нравится»\n"
-        "/download 3 — последние 3 трека списка (для проверки)\n"
+        "/download 3 — первые 3 трека (для проверки)\n"
         "/download 1-100 — треки с 1-го по 100-й (перенос частями)\n\n"
         "/playlist логин номер — публичный плейлист целиком\n"
         "/playlist логин номер 1-100 — часть плейлиста\n"
