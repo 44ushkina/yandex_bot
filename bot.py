@@ -66,7 +66,7 @@ for _src in ("/etc/secrets/cookies.txt", "cookies.txt"):
             logging.warning(f"Не удалось подготовить cookies: {_e}")
         break
 
-YT_BLOCK_MINUTES = 30      # на сколько пропускать YouTube после отказа
+YT_BLOCK_MINUTES = 120     # на сколько пропускать YouTube после отказа
 YT_BLOCKED_UNTIL = 0.0
 
 
@@ -74,14 +74,21 @@ def yt_is_blocked():
     return time.time() < YT_BLOCKED_UNTIL
 
 
-def note_yt_error(message):
-    """Если YouTube просит войти (блокирует сервер), на время отключаем его, чтобы не тратить время."""
+def note_yt_error(message, youtube_context=False):
+    """
+    Если YouTube блокирует сервер (просит войти или отвечает 403), на время отключаем его,
+    чтобы не тратить время на заведомо неудачные запросы.
+    youtube_context=True: сообщение относится именно к запросу к YouTube.
+    """
     global YT_BLOCKED_UNTIL
     text = str(message)
-    if "Sign in to confirm" in text or "not a bot" in text:
+    blocked = "Sign in to confirm" in text or "not a bot" in text
+    if youtube_context and "403" in text and "Forbidden" in text:
+        blocked = True
+    if blocked:
         if not yt_is_blocked():
             logging.warning(
-                f"YouTube блокирует сервер (запрос подтверждения), отключаю его на {YT_BLOCK_MINUTES} мин"
+                f"YouTube блокирует сервер, отключаю его на {YT_BLOCK_MINUTES} мин"
             )
         YT_BLOCKED_UNTIL = time.time() + YT_BLOCK_MINUTES * 60
         return True
@@ -90,6 +97,9 @@ def note_yt_error(message):
 
 class YtLogger:
     """Тихий логгер для yt-dlp: не засоряет логи, но замечает блокировку YouTube."""
+
+    def __init__(self, youtube=False):
+        self.youtube = youtube
 
     def debug(self, msg):
         pass
@@ -101,7 +111,7 @@ class YtLogger:
         pass
 
     def error(self, msg):
-        if not note_yt_error(msg):
+        if not note_yt_error(msg, self.youtube):
             logging.warning(f"yt-dlp: {str(msg)[:200]}")
 
 
@@ -352,7 +362,13 @@ def yandex_track_info(short_track):
 
 
 # ---------- умный поиск аудио ----------
-def score_entry(entry, artist_words, first_artist_words, title_core_words, title_full_words):
+def squash(text):
+    """Слитное написание без пробелов и знаков: 'Bruno Mars' и 'brunomars' становятся одинаковыми."""
+    return skeleton(re.sub(r"[\W_]+", "", (text or "").lower()))
+
+
+def score_entry(entry, artist_words, first_artist_words, title_core_words, title_full_words,
+                artists_text="", first_artist_text=""):
     """Оценка того, насколько найденный результат похож на нужный трек."""
     found_title = entry.get("title") or ""
     uploader = entry.get("uploader") or entry.get("channel") or ""
@@ -374,7 +390,21 @@ def score_entry(entry, artist_words, first_artist_words, title_core_words, title
         or (core_first and first_hits / len(core_first) >= 0.5)
     )
 
+    # исполнитель, записанный слитно («brunomars», «dopeclvb» как имя канала): сравниваем
+    # слитные написания, иначе официальные загрузки артистов отбрасывались
+    squashed_found = squash(found_title + " " + uploader)
+    squashed_uploader = squash(uploader)
+    uploader_is_artist = False
+    for name in (first_artist_text, artists_text):
+        sq = squash(name)
+        if len(sq) >= 4 and sq in squashed_found:
+            artist_ok = True
+        if len(sq) >= 4 and sq in squashed_uploader:
+            uploader_is_artist = True
+
     score = title_part * 2 + artist_part
+    if uploader_is_artist:
+        score += 0.3  # официальная загрузка от самого исполнителя
 
     # автоматические каналы YouTube «Исполнитель - Topic» хранят оригинальные студийные версии
     if artist_ok and uploader.strip().lower().endswith("topic"):
@@ -398,7 +428,8 @@ def is_mostly_latin(text):
     return sum(1 for c in letters if c.isascii()) / len(letters) > 0.7
 
 
-def search_candidates(query, artist_words, first_artist_words, title_core_words, title_full_words, orig_duration):
+def search_candidates(query, artist_words, first_artist_words, title_core_words, title_full_words, orig_duration,
+                      artists_text="", first_artist_text=""):
     """
     Ищет по запросу. Возвращает два списка кандидатов:
     точные (оценка, разница_длительности, результат) и
@@ -411,7 +442,7 @@ def search_candidates(query, artist_words, first_artist_words, title_core_words,
         "socket_timeout": 30,
         "ignoreerrors": True,
         "skip_download": True,
-        "logger": YtLogger(),
+        "logger": YtLogger(query.startswith("ytsearch")),
     }
     if COOKIE_FILE:
         opts["cookiefile"] = COOKIE_FILE
@@ -443,7 +474,8 @@ def search_candidates(query, artist_words, first_artist_words, title_core_words,
                     continue
 
             score, title_part, bad, artist_ok = score_entry(
-                entry, artist_words, first_artist_words, title_core_words, title_full_words
+                entry, artist_words, first_artist_words, title_core_words, title_full_words,
+                artists_text, first_artist_text,
             )
             if diff is not None and diff <= 3:
                 score += 0.5
@@ -478,6 +510,7 @@ def search_candidates(query, artist_words, first_artist_words, title_core_words,
 
 def download_url(url):
     """Скачивает конкретную ссылку и возвращает путь к mp3 или None."""
+    is_youtube = "youtube.com" in url or "youtu.be" in url
     opts = {
         "format": "bestaudio/best",
         "postprocessors": [
@@ -489,7 +522,7 @@ def download_url(url):
         "noprogress": True,
         "socket_timeout": 30,
         "noplaylist": True,
-        "logger": YtLogger(),
+        "logger": YtLogger(is_youtube),
     }
     if COOKIE_FILE:
         opts["cookiefile"] = COOKIE_FILE
@@ -503,7 +536,7 @@ def download_url(url):
             if os.path.exists(mp3):
                 return mp3
     except Exception as e:
-        if not note_yt_error(e):
+        if not note_yt_error(e, is_youtube):
             logging.warning(f"Ошибка скачивания {url}: {e}")
     return None
 
@@ -527,12 +560,13 @@ def download_track_public(artists, title, orig_duration=None, allow_relaxed=True
     title_core_words = norm_words(title_core)
     title_full_words = norm_words(title)
 
-    # два самых полезных варианта запроса (без повторов); более расплывчатые только
-    # замедляли поиск и почти не находили новых совпадений
+    # варианты запроса без повторов; SoundCloud сейчас основной рабочий источник,
+    # поэтому для него пробуем три формулировки
     query_texts = []
     for text in (
         f"{artists} - {title}",
         f"{first_artist} - {title_core}",
+        f"{title_core} {first_artist}",
     ):
         if text not in query_texts:
             query_texts.append(text)
@@ -540,9 +574,9 @@ def download_track_public(artists, title, orig_duration=None, allow_relaxed=True
     # для YouTube второй запрос выводит автоматические «Topic»-каналы с оригиналами
     yt_texts = query_texts[:1] + [f"{first_artist} {title_core} topic"]
 
-    sources = [("scsearch6", query_texts), ("ytsearch4", yt_texts)]
-    # зарубежные треки на YouTube находятся заметно лучше, чем на SoundCloud
-    if is_mostly_latin(f"{artists} {title}"):
+    sources = [("scsearch8", query_texts), ("ytsearch4", yt_texts)]
+    # зарубежные треки на YouTube находятся заметно лучше, но только если YouTube не блокирует сервер
+    if is_mostly_latin(f"{artists} {title}") and not yt_is_blocked():
         sources.reverse()
     relaxed_pool = {}
 
@@ -560,7 +594,8 @@ def download_track_public(artists, title, orig_duration=None, allow_relaxed=True
             query = f"{source}:{text}"
             logging.info(f"Запрос: {query}")
             strict, relaxed = search_candidates(
-                query, artist_words, first_artist_words, title_core_words, title_full_words, orig_duration
+                query, artist_words, first_artist_words, title_core_words, title_full_words, orig_duration,
+                artists, first_artist,
             )
             for cand in relaxed:
                 url = cand[2].get("webpage_url") or cand[2].get("url")
@@ -596,8 +631,9 @@ def download_track_public(artists, title, orig_duration=None, allow_relaxed=True
 class CaptureLogger:
     """Собирает сообщения yt-dlp, чтобы показать их в диагностике."""
 
-    def __init__(self):
+    def __init__(self, youtube=False):
         self.msgs = []
+        self.youtube = youtube
 
     def debug(self, msg):
         pass
@@ -610,7 +646,7 @@ class CaptureLogger:
 
     def error(self, msg):
         self.msgs.append(str(msg))
-        note_yt_error(msg)
+        note_yt_error(msg, self.youtube)
 
 
 def _short(text, limit=220):
@@ -633,7 +669,7 @@ def run_diagnostics(query):
     lines.append("")
 
     # --- YouTube: поиск ---
-    cap = CaptureLogger()
+    cap = CaptureLogger(youtube=True)
     opts = {
         "quiet": True,
         "skip_download": True,
@@ -663,7 +699,7 @@ def run_diagnostics(query):
     # --- YouTube: доступны ли форматы у первого видео (без скачивания) ---
     if entries:
         url = entries[0].get("url") or entries[0].get("webpage_url")
-        cap2 = CaptureLogger()
+        cap2 = CaptureLogger(youtube=True)
         o2 = {
             "quiet": True,
             "skip_download": True,
