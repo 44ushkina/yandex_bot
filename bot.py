@@ -113,22 +113,39 @@ def yt_is_blocked():
     return time.time() < YT_BLOCKED_UNTIL
 
 
+YT_403_COUNT = 0           # сколько ошибок 403 подряд (без единой удачи между ними)
+YT_403_LIMIT = 3           # после стольких подряд считаем, что YouTube нас не пускает
+
+
+def yt_success():
+    """Вызывается, когда YouTube ответил нормально: сбрасывает счётчик ошибок."""
+    global YT_403_COUNT
+    YT_403_COUNT = 0
+
+
 def note_yt_error(message, youtube_context=False):
     """
-    Если YouTube блокирует сервер (просит войти или отвечает 403), на время отключаем его,
-    чтобы не тратить время на заведомо неудачные запросы.
+    Если YouTube блокирует сервер, на время отключаем его, чтобы не тратить время на
+    заведомо неудачные запросы. «Подтвердите, что вы не бот» блокирует сразу. Одиночная ошибка 403
+    может касаться только одного видео, поэтому нужны несколько подряд.
     youtube_context=True: сообщение относится именно к запросу к YouTube.
     """
-    global YT_BLOCKED_UNTIL
+    global YT_BLOCKED_UNTIL, YT_403_COUNT
     text = str(message)
     blocked = "Sign in to confirm" in text or "not a bot" in text
     if youtube_context and "403" in text and "Forbidden" in text:
-        blocked = True
+        YT_403_COUNT += 1
+        logging.warning(f"YouTube 403 ({YT_403_COUNT} подряд): {text[:160]}")
+        if YT_403_COUNT >= YT_403_LIMIT:
+            blocked = True
     if blocked:
         minutes = 30 if WARP_PROXY else YT_BLOCK_MINUTES
         if not yt_is_blocked():
-            logging.warning(f"YouTube блокирует сервер, отключаю его на {minutes} мин")
+            logging.warning(
+                f"YouTube блокирует сервер, отключаю его на {minutes} мин. Причина: {text[:200]}"
+            )
         YT_BLOCKED_UNTIL = time.time() + minutes * 60
+        YT_403_COUNT = 0
         return True
     return False
 
@@ -466,6 +483,9 @@ async def start_web_server():
 
 
 # ---------- Яндекс Музыка (синхронные функции, вызываются через to_thread) ----------
+YCLIENT = None  # общий клиент Яндекса, нужен позже для загрузки данных отдельных треков
+
+
 def yandex_get_playlist(token, login=None, kind=None, uuid=None):
     """
     Возвращает (название плейлиста, список треков).
@@ -473,7 +493,9 @@ def yandex_get_playlist(token, login=None, kind=None, uuid=None):
       старый: music.yandex.ru/users/ЛОГИН/playlists/НОМЕР  -> login + kind
       новый:  music.yandex.ru/playlists/lk.xxxxxxxx-...     -> uuid
     """
+    global YCLIENT
     client = Client(token).init() if token else Client().init()
+    YCLIENT = client
 
     if uuid:
         playlist = None
@@ -517,7 +539,28 @@ def yandex_get_playlist(token, login=None, kind=None, uuid=None):
 
     sizes = {name: len(items) for name, items in candidates.items()}
     logging.info(f"Плейлист '{title}': заявлено Яндексом={declared}, получено={sizes}")
-    tracks = list(max(candidates.values(), key=len))
+    best = max(candidates.values(), key=len)
+
+    # храним только короткие идентификаторы «id:альбом», а не тяжёлые объекты Яндекса:
+    # так плейлист на 2000+ треков почти не занимает память сервера
+    tracks = []
+    for item in best:
+        inner = getattr(item, "track", None) or item
+        base = getattr(item, "id", None) or getattr(inner, "id", None)
+        if base is None:
+            continue
+        alb = getattr(item, "album_id", None)
+        if not alb:
+            albums = getattr(inner, "albums", None)
+            if albums:
+                alb = getattr(albums[0], "id", None)
+        if alb:
+            tid = f"{base}:{alb}"
+        else:
+            tid = getattr(item, "track_id", None) or str(base)
+        tracks.append(str(tid))
+    del candidates, best, playlist
+    trim_memory()
 
     # «Мне нравится» (kind=3): Яндекс отдаёт от новых к старым, разворачиваем
     if getattr(playlist, "kind", None) == 3 and LIKES_OLDEST_FIRST:
@@ -525,9 +568,12 @@ def yandex_get_playlist(token, login=None, kind=None, uuid=None):
     return title, tracks, declared
 
 
-def yandex_track_info(short_track):
+def yandex_track_info(track_id):
     """Возвращает (название, артисты, путь к обложке или None, длительность в секундах или None)."""
-    track = short_track.fetch_track()
+    found = YCLIENT.tracks([track_id]) if YCLIENT else []
+    if not found:
+        raise RuntimeError("Яндекс не вернул данные трека")
+    track = found[0]
     title = track.title
     # у Яндекса версия трека (Remix, Slowed, Live...) лежит в отдельном поле
     version = getattr(track, "version", None)
@@ -664,6 +710,8 @@ def search_candidates(query, artist_words, first_artist_words, title_core_words,
             return strict, relaxed
         entries = [e for e in (info.get("entries") or []) if e]
         logging.info(f"   найдено результатов: {len(entries)}")
+        if entries and query.startswith("ytsearch"):
+            yt_success()
         for entry in entries:
             found_duration = entry.get("duration")
             if found_duration and found_duration > 600:
@@ -740,6 +788,8 @@ def download_url(url):
                 return None
             mp3 = os.path.splitext(ydl.prepare_filename(info))[0] + ".mp3"
             if os.path.exists(mp3):
+                if is_youtube:
+                    yt_success()
                 return mp3
     except Exception as e:
         if not note_yt_error(e, is_youtube):
