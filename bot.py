@@ -1,6 +1,8 @@
 import os
 import re
 import io
+import time
+import shutil
 import random
 import html
 import asyncio
@@ -44,6 +46,72 @@ dp = Dispatcher()
 
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+# ---------- YouTube: куки (необязательно) и защита от блокировки ----------
+# Если на Render добавлен Secret File с именем cookies.txt, бот будет использовать его
+# для YouTube. Без него YouTube с адресов хостингов обычно блокирует запросы.
+COOKIE_FILE = None
+for _src in ("/etc/secrets/cookies.txt", "cookies.txt"):
+    if os.path.exists(_src):
+        try:
+            COOKIE_FILE = os.path.join(DOWNLOAD_DIR, "yt_cookies.txt")
+            shutil.copy(_src, COOKIE_FILE)  # копия, потому что yt-dlp может её перезаписывать
+            logging.info("Найден файл cookies, YouTube будет использовать его")
+        except Exception as _e:
+            COOKIE_FILE = None
+            logging.warning(f"Не удалось подготовить cookies: {_e}")
+        break
+
+YT_BLOCK_MINUTES = 30      # на сколько пропускать YouTube после отказа
+YT_BLOCKED_UNTIL = 0.0
+
+
+def yt_is_blocked():
+    return time.time() < YT_BLOCKED_UNTIL
+
+
+def note_yt_error(message):
+    """Если YouTube просит войти (блокирует сервер), на время отключаем его, чтобы не тратить время."""
+    global YT_BLOCKED_UNTIL
+    text = str(message)
+    if "Sign in to confirm" in text or "not a bot" in text:
+        if not yt_is_blocked():
+            logging.warning(
+                f"YouTube блокирует сервер (запрос подтверждения), отключаю его на {YT_BLOCK_MINUTES} мин"
+            )
+        YT_BLOCKED_UNTIL = time.time() + YT_BLOCK_MINUTES * 60
+        return True
+    return False
+
+
+class YtLogger:
+    """Тихий логгер для yt-dlp: не засоряет логи, но замечает блокировку YouTube."""
+
+    def debug(self, msg):
+        pass
+
+    def info(self, msg):
+        pass
+
+    def warning(self, msg):
+        pass
+
+    def error(self, msg):
+        if not note_yt_error(msg):
+            logging.warning(f"yt-dlp: {str(msg)[:200]}")
+
+
+def with_retry(fn, *args, tries=4, delay=3):
+    """Повторяет вызов при временных сбоях (например, 429 «слишком много запросов» от Яндекса)."""
+    for attempt in range(tries):
+        try:
+            return fn(*args)
+        except Exception as e:
+            if attempt == tries - 1:
+                raise
+            logging.warning(f"Сбой {getattr(fn, '__name__', fn)} (попытка {attempt + 1}/{tries}): {e}")
+            time.sleep(delay * (attempt + 1))
+
 
 # ---------- настройки (можно менять) ----------
 
@@ -269,7 +337,10 @@ def search_candidates(query, artist_words, first_artist_words, title_core_words,
         "socket_timeout": 30,
         "ignoreerrors": True,
         "skip_download": True,
+        "logger": YtLogger(),
     }
+    if COOKIE_FILE:
+        opts["cookiefile"] = COOKIE_FILE
     strict, relaxed = [], []
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -340,7 +411,10 @@ def download_url(url):
         "noprogress": True,
         "socket_timeout": 30,
         "noplaylist": True,
+        "logger": YtLogger(),
     }
+    if COOKIE_FILE:
+        opts["cookiefile"] = COOKIE_FILE
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -350,7 +424,8 @@ def download_url(url):
             if os.path.exists(mp3):
                 return mp3
     except Exception as e:
-        logging.warning(f"Ошибка скачивания {url}: {e}")
+        if not note_yt_error(e):
+            logging.warning(f"Ошибка скачивания {url}: {e}")
     return None
 
 
@@ -394,6 +469,9 @@ def download_track_public(artists, title, orig_duration=None, allow_relaxed=True
 
     for source, texts in sources:
         for text in texts:
+            if source.startswith("ytsearch") and yt_is_blocked():
+                logging.info("YouTube сейчас блокирует сервер, пропускаю")
+                break
             query = f"{source}:{text}"
             logging.info(f"Запрос: {query}")
             strict, relaxed = search_candidates(
@@ -695,7 +773,7 @@ async def run_job(chat_id, user_id, start, end, picks=None):
                 artists = title = ""
                 try:
                     title, artists, cover, duration = await asyncio.to_thread(
-                        yandex_track_info, short_track
+                        with_retry, yandex_track_info, short_track
                     )
 
                     if picks:
@@ -770,6 +848,11 @@ async def run_job(chat_id, user_id, start, end, picks=None):
         lines.append(f"⚠️ Возможно другая версия: {len(flagged)}")
     if failed:
         lines.append(f"🔍 Не найдено: {len(failed)}")
+        if yt_is_blocked():
+            lines.append(
+                "ℹ️ YouTube сейчас не отвечает серверу бота, поэтому часть зарубежных треков "
+                "могла не найтись. Это не связано с вашим плейлистом."
+            )
 
     problem_lines = []
     if flagged:
@@ -935,7 +1018,7 @@ async def handle_link(message: Message, login=None, kind=None, uuid=None):
     wait = await message.answer("🔎 Открываю плейлист...")
     try:
         title, tracks = await asyncio.to_thread(
-            yandex_get_playlist, YANDEX_TOKEN, login, kind, uuid
+            with_retry, yandex_get_playlist, YANDEX_TOKEN, login, kind, uuid, tries=2
         )
     except Exception as e:
         logging.warning(f"Не удалось открыть плейлист {login}/{kind}/{uuid}: {e}")
