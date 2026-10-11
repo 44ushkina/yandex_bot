@@ -9,6 +9,8 @@ import logging
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import (
@@ -31,7 +33,12 @@ if not BOT_TOKEN:
 # Токен Яндекса нужен только для чтения публичных плейлистов
 YANDEX_TOKEN = os.environ.get("YANDEX_TOKEN", "")
 
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+# Увеличенный таймаут: на слабом бесплатном сервере отправка файла может идти долго
+bot = Bot(
+    token=BOT_TOKEN,
+    session=AiohttpSession(timeout=300),
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
 dp = Dispatcher()
 
 DOWNLOAD_DIR = "downloads"
@@ -219,6 +226,8 @@ def search_candidates(query, artist_words, title_core_words, title_full_words, o
     opts = {
         "quiet": True,
         "no_warnings": True,
+        "noprogress": True,
+        "socket_timeout": 30,
         "ignoreerrors": True,
         "skip_download": True,
     }
@@ -276,6 +285,8 @@ def download_url(url):
         "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
+        "noprogress": True,
+        "socket_timeout": 30,
         "noplaylist": True,
     }
     try:
@@ -529,6 +540,30 @@ async def safe_edit(chat_id, message_id, text, reply_markup=None):
         pass
 
 
+async def send_audio_retry(chat_id, file_path, title, artists, cover, caption):
+    """Отправляет трек, при сетевых сбоях повторяет попытку до 3 раз."""
+    last_error = None
+    for attempt in range(3):
+        try:
+            await bot.send_audio(
+                chat_id,
+                audio=FSInputFile(file_path),
+                title=title,
+                performer=artists,
+                thumbnail=FSInputFile(cover) if cover and os.path.exists(cover) else None,
+                caption=caption,
+            )
+            return
+        except TelegramRetryAfter as e:
+            last_error = e
+            await asyncio.sleep(e.retry_after + 1)
+        except TelegramNetworkError as e:
+            last_error = e
+            logging.warning(f"Сбой отправки (попытка {attempt + 1}/3): {e}")
+            await asyncio.sleep(5)
+    raise last_error
+
+
 async def run_job(chat_id, user_id, start, end):
     session = sessions.get(user_id)
     if not session:
@@ -595,13 +630,13 @@ async def run_job(chat_id, user_id, start, end):
                         download_track_public, artists, title, duration
                     )
                     if file_path:
-                        await bot.send_audio(
+                        await send_audio_retry(
                             chat_id,
-                            audio=FSInputFile(file_path),
-                            title=title,
-                            performer=artists,
-                            thumbnail=FSInputFile(cover) if cover and os.path.exists(cover) else None,
-                            caption=f"⚠️ {html.escape(note)}" if note else None,
+                            file_path,
+                            title,
+                            artists,
+                            cover,
+                            f"⚠️ {html.escape(note)}" if note else None,
                         )
                         ok += 1
                         if note:
