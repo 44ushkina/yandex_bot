@@ -161,12 +161,15 @@ def score_entry(entry, artist_words, title_core_words, title_full_words):
 
     score = title_part * 2 + artist_part
 
-    # штраф за ремиксы, каверы, ускоренные версии и т.п.,
-    # если такого слова нет в оригинальном названии
-    bad = (norm_words(found_title) & BAD_WORDS) - title_full_words
-    score -= 0.7 * len(bad)
+    # слова-пометки (ремикс, кавер, ускорено...), которых нет в оригинальном названии
+    found_title_words = norm_words(found_title)
+    bad = (found_title_words & BAD_WORDS) - title_full_words
 
-    return score, title_part
+    # небольшой штраф за лишние слова в названии (предпочитаем самое "чистое" название)
+    extra = found_title_words - artist_words - title_full_words
+    score -= 0.1 * min(len(extra), 4)
+
+    return score, title_part, bad
 
 
 def search_candidates(query, artist_words, title_core_words, title_full_words, orig_duration):
@@ -202,7 +205,7 @@ def search_candidates(query, artist_words, title_core_words, title_full_words, o
                     )
                     continue
 
-            score, title_part = score_entry(entry, artist_words, title_core_words, title_full_words)
+            score, title_part, bad = score_entry(entry, artist_words, title_core_words, title_full_words)
             if diff is not None and diff <= 3:
                 score += 0.5
             logging.info(
@@ -210,8 +213,12 @@ def search_candidates(query, artist_words, title_core_words, title_full_words, o
                 f"название={title_part:.2f} разница={diff}"
             )
             if title_part >= 0.6 and score >= 2.0:
-                if diff is not None and diff > MAX_DURATION_DIFF:
-                    relaxed.append((score, diff, entry))
+                if bad:
+                    reason = "в названии есть пометка вроде remix/cover/ускорено"
+                    relaxed.append((score, diff or 0, entry, reason, True))
+                elif diff is not None and diff > MAX_DURATION_DIFF:
+                    reason = f"длительность отличается от Яндекса на {diff:.0f} с"
+                    relaxed.append((score, diff, entry, reason, False))
                 else:
                     strict.append((score, diff or 0, entry))
     except Exception as e:
@@ -297,13 +304,13 @@ def download_track_public(artists, title, orig_duration=None):
                     return path, None
 
     # запасной вариант: файлы с заметной разницей длительности
-    pool = sorted(relaxed_pool.values(), key=lambda c: (c[1], -c[0]))
-    for score, diff, entry in pool[:3]:
+    pool = sorted(relaxed_pool.values(), key=lambda c: (c[4], c[1], -c[0]))
+    for score, diff, entry, reason, is_bad in pool[:3]:
         url = entry.get("webpage_url") or entry.get("url")
-        logging.info(f"Запасной вариант: '{entry.get('title')}' (разница {diff:.0f} с)")
+        logging.info(f"Запасной вариант: '{entry.get('title')}' ({reason})")
         path = download_url(url)
         if path:
-            return path, f"длительность отличается от Яндекса на {diff:.0f} с, возможно другая версия"
+            return path, f"{reason}, возможно другая версия"
 
     return None, None
 
