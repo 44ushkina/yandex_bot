@@ -1,4 +1,5 @@
 import os
+import gc
 import re
 import io
 import time
@@ -34,6 +35,43 @@ from yandex_music import Client
 import yt_dlp
 
 logging.basicConfig(level=logging.INFO)
+
+
+# ---------- память (на бесплатном Render всего 512 МБ) ----------
+def mem_report():
+    """Строка с расходом памяти: весь контейнер и сам бот (для логов и /diag)."""
+    total = own = None
+    for path in ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
+        try:
+            with open(path) as f:
+                total = int(f.read().strip()) / 1048576
+            break
+        except Exception:
+            pass
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    own = int(line.split()[1]) / 1024
+                    break
+    except Exception:
+        pass
+    parts = []
+    if total is not None:
+        parts.append(f"всего {total:.0f} МБ из 512")
+    if own is not None:
+        parts.append(f"сам бот {own:.0f} МБ")
+    return ", ".join(parts) or "нет данных"
+
+
+def trim_memory():
+    """Освобождает память, которую Python уже не использует, но не вернул системе."""
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
@@ -124,6 +162,8 @@ JS_OPTS = {}
 def ensure_js_runtime():
     """Скачивает (если нужно) Deno и подключает его к yt-dlp. Ошибки не должны ронять бота."""
     global JS_OPTS
+    # ограничиваем память, которую может занять JavaScript-движок (иначе Render перезапускает бота)
+    os.environ.setdefault("DENO_V8_FLAGS", "--max-old-space-size=128")
     try:
         bin_dir = os.path.abspath("bin")
         deno_path = shutil.which("deno") or os.path.join(bin_dir, "deno")
@@ -268,8 +308,10 @@ def ensure_warp():
         with open(conf_path, "w", encoding="utf-8") as f:
             f.write(conf + f"\n[Socks5]\nBindAddress = 127.0.0.1:{WARP_PORT}\n")
 
+        warp_env = dict(os.environ, GOMEMLIMIT="48MiB", GOGC="50")
         _warp_proc = subprocess.Popen(
-            [wireproxy, "-c", conf_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            [wireproxy, "-c", conf_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=warp_env,
         )
         time.sleep(4)
         if _warp_proc.poll() is not None:
@@ -837,6 +879,7 @@ def run_diagnostics(query):
     lines.append(f"JS-движок: {'подключён' if JS_OPTS else 'НЕ подключён'}")
     lines.append(f"Cookies: {'есть' if COOKIE_FILE else 'нет'}")
     lines.append(f"WARP-прокси для YouTube: {WARP_STATUS}")
+    lines.append(f"Память: {mem_report()}")
     lines.append(f"YouTube помечен как заблокированный: {'да' if yt_is_blocked() else 'нет'}")
     lines.append(f"Запрос: {query}")
     lines.append("")
@@ -1246,6 +1289,8 @@ async def run_job(chat_id, user_id, start, end, picks=None):
 
                 last_done = number
                 processed += 1
+                trim_memory()
+                logging.info(f"Память после трека №{number}: {mem_report()}")
 
                 # пауза, чтобы Telegram не ограничил бота за частые отправки
                 await asyncio.sleep(3)
