@@ -1,5 +1,7 @@
 import os
 import gc
+import json
+import urllib.parse
 import re
 import io
 import time
@@ -569,6 +571,202 @@ def yandex_get_playlist(token, login=None, kind=None, uuid=None):
     return title, tracks, declared
 
 
+def get_yclient():
+    """Общий клиент Яндекса (создаётся при первом обращении)."""
+    global YCLIENT
+    if YCLIENT is None:
+        YCLIENT = Client(YANDEX_TOKEN).init() if YANDEX_TOKEN else Client().init()
+    return YCLIENT
+
+
+def yandex_search_tracks(text, limit=5):
+    """Ищет треки в Яндекс Музыке по тексту. Возвращает список словарей id/title/artists/duration."""
+    client = get_yclient()
+    res = client.search(text, type_="track")
+    items = list(getattr(getattr(res, "tracks", None), "results", None) or [])[:limit]
+    out = []
+    for t in items:
+        title = t.title
+        version = getattr(t, "version", None)
+        if version and version.lower() not in title.lower():
+            title = f"{title} ({version})"
+        album_id = t.albums[0].id if getattr(t, "albums", None) else None
+        out.append(
+            {
+                "id": f"{t.id}:{album_id}" if album_id else str(t.id),
+                "title": title,
+                "artists": ", ".join(a.name for a in t.artists),
+                "duration": (t.duration_ms / 1000) if t.duration_ms else None,
+            }
+        )
+    return out
+
+
+def deezer_search(text, limit=5):
+    """Ищет треки в каталоге Deezer (бесплатный открытый API): название, исполнитель, длительность, обложка."""
+    url = f"https://api.deezer.com/search/track?limit={limit}&q={urllib.parse.quote(text)}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    out = []
+    for t in data.get("data") or []:
+        out.append(
+            {
+                "src": "dz",
+                "id": str(t.get("id")),
+                "title": t.get("title") or "",
+                "artists": (t.get("artist") or {}).get("name", ""),
+                "duration": t.get("duration") or None,
+                "cover_url": (t.get("album") or {}).get("cover_medium")
+                or (t.get("album") or {}).get("cover"),
+            }
+        )
+    return out
+
+
+def catalog_search(text):
+    """Яндекс Музыка + Deezer. Каждый каталог может отказать, это не страшно. Возвращает до 6 вариантов."""
+    merged, seen = [], set()
+    sources = (("ym", lambda: yandex_search_tracks(text, 4)), ("dz", lambda: deezer_search(text, 4)))
+    for name, fn in sources:
+        try:
+            items = fn()
+        except Exception as e:
+            logging.warning(f"Каталог {name} не ответил: {e}")
+            continue
+        for it in items:
+            it["src"] = name
+            key = squash(it["artists"] + it["title"])
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(it)
+    return merged[:6]
+
+
+def prepare_cover(url, key):
+    """Скачивает картинку и готовит из неё квадратную обложку для Telegram (до 240 px). Путь или None."""
+    if not url:
+        return None
+    raw = os.path.join(DOWNLOAD_DIR, f"raw_{key}")
+    out = os.path.join(DOWNLOAD_DIR, f"cover_{key}.jpg")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=20) as resp, open(raw, "wb") as f:
+            f.write(resp.read(4_000_000))
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", raw, "-vf",
+             "scale=240:240:force_original_aspect_ratio=increase,crop=240:240", "-q:v", "4", out],
+            capture_output=True, timeout=30,
+        )
+        return out if os.path.exists(out) and os.path.getsize(out) > 0 else None
+    except Exception as e:
+        logging.info(f"Обложка не загрузилась: {e}")
+        return None
+    finally:
+        if os.path.exists(raw):
+            os.remove(raw)
+
+
+def catalog_track_info(item):
+    """(название, артисты, путь к обложке, длительность) для варианта из каталога."""
+    if item.get("src") == "dz":
+        cover = prepare_cover(item.get("cover_url"), f"dz{item['id']}")
+        return item["title"], item["artists"], cover, item.get("duration")
+    return yandex_track_info(item["id"])
+
+
+def split_artist_title(title, uploader):
+    """Из названия вида «Исполнитель - Название» достаёт (название, исполнитель)."""
+    t = re.sub(
+        r"\s*[\(\[]\s*(official|lyric|audio|video|music video|hd|hq|clip|клип)[^\)\]]*[\)\]]",
+        "", title or "", flags=re.IGNORECASE,
+    ).strip()
+    parts = re.split(r"\s+[-–—]\s+", t, maxsplit=1)
+    if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+        return parts[1].strip(), parts[0].strip()
+    artist = re.sub(r"\s*-\s*Topic$", "", uploader or "", flags=re.IGNORECASE).strip()
+    return t or (title or "Трек"), artist or "—"
+
+
+def official_cover_url(title, duration):
+    """Ищет официальную обложку в Deezer. Берёт её, только если трек совпал по названию, исполнителю и длительности."""
+    text = re.sub(r"[\(\[].*?[\)\]]", " ", title or "").strip()
+    if not text:
+        return None
+    qwords = norm_words(text)
+    try:
+        items = deezer_search(text, 5)
+    except Exception:
+        return None
+    for it in items:
+        fw = norm_words(it["artists"] + " " + it["title"])
+        if fuzzy_overlap(fw, qwords) >= 0.8 and fuzzy_overlap(qwords, fw) >= 0.6:
+            if duration and it.get("duration") and abs(it["duration"] - duration) > 20:
+                continue
+            return it.get("cover_url")
+    return None
+
+
+def raw_search(text):
+    """
+    Прямой поиск на SoundCloud и YouTube без каталогов. Возвращает до 7 вариантов.
+    Подходит для треков, которых нет в Яндекс Музыке.
+    """
+    qwords = norm_words(text)
+    entries = []
+    base = {
+        "quiet": True, "no_warnings": True, "skip_download": True, "ignoreerrors": True,
+        "ignore_no_formats_error": True, "socket_timeout": 30,
+    }
+    try:
+        opts = dict(base, logger=YtLogger(False))
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"scsearch8:{text}", download=False)
+        for e in (info or {}).get("entries") or []:
+            if e:
+                entries.append(("SC", e))
+    except Exception as e:
+        logging.warning(f"Прямой поиск SoundCloud: {e}")
+    if not yt_is_blocked():
+        try:
+            opts = dict(base, extract_flat=True, logger=YtLogger(True))
+            use_warp(opts, True)
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(f"ytsearch6:{text}", download=False)
+            for e in (info or {}).get("entries") or []:
+                if e:
+                    entries.append(("YT", e))
+        except Exception as e:
+            logging.warning(f"Прямой поиск YouTube: {e}")
+
+    out, seen = [], set()
+    for tag, e in entries:
+        url = e.get("webpage_url") or e.get("url")
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        dur = e.get("duration")
+        if dur and (dur < 60 or dur > 900):
+            continue  # отрывки и длинные миксы
+        title = e.get("title") or ""
+        uploader = e.get("uploader") or e.get("channel") or ""
+        found = norm_words(title + " " + uploader)
+        rel = fuzzy_overlap(qwords, found)
+        if rel < 0.5:
+            continue
+        bad = bool((norm_words(title) & BAD_WORDS) - qwords)
+        thumb = e.get("thumbnail")
+        if not thumb and e.get("thumbnails"):
+            thumb = e["thumbnails"][-1].get("url")
+        out.append(
+            {"src": tag, "url": url, "title": title, "uploader": uploader, "duration": dur,
+             "thumb": thumb, "bad": bad, "rel": rel}
+        )
+    out.sort(key=lambda r: (r["bad"], -r["rel"]))
+    return out[:7]
+
+
 def yandex_track_info(track_id):
     """Возвращает (название, артисты, путь к обложке или None, длительность в секундах или None)."""
     found = YCLIENT.tracks([track_id]) if YCLIENT else []
@@ -1052,7 +1250,7 @@ MENU_TEXT = (
     "Я переношу плейлисты из Яндекс Музыки в Telegram: название, исполнитель, "
     "обложка и сам трек.\n\n"
     "<b>Как начать</b>\n"
-    "Просто отправьте мне ссылку на плейлист.\n\n"
+    "Отправьте мне ссылку на плейлист или нажмите «Найти один трек».\n\n"
     "Нужна помощь со ссылкой? Загляните в раздел «Помощь» ниже 👇"
 )
 
@@ -1101,6 +1299,7 @@ INFO_TEXTS = {
         "Скорее всего, плейлист закрыт для посторонних. Откройте доступ и отправьте ссылку снова.\n\n"
         "<b>Команды</b>\n"
         "/start — главное меню\n"
+        "/find — найти один трек\n"
         "/stop — остановить перенос\n"
         "/help — эта справка"
     ),
@@ -1116,8 +1315,27 @@ def kb(*rows):
     return InlineKeyboardMarkup(inline_keyboard=[list(r) for r in rows])
 
 
+SINGLE_PROMPT = (
+    "🔍 <b>Поиск одного трека</b>\n\n"
+    "Отправьте исполнителя и название одним сообщением, например:\n"
+    "<code>Исполнитель - Название</code>\n\n"
+    "Сначала я ищу трек в каталогах (Яндекс Музыка, Deezer): оттуда берутся точное название, "
+    "обложка и длительность, по которой бот проверяет версию файла.\n"
+    "Если трека нет в каталогах, я поищу его напрямую на SoundCloud и YouTube. "
+    "Обложку при этом постараюсь взять из официального каталога."
+)
+
+
+def fmt_dur(seconds):
+    if not seconds:
+        return "?:??"
+    seconds = int(round(seconds))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
 def menu_kb():
     return kb(
+        [btn("🔍 Найти один трек", "single")],
         [btn("📖 Как это работает", "info:how:menu"), btn("⏱ Время и фон", "info:time:menu")],
         [btn("🔎 О поиске", "info:search:menu"), btn("❓ Помощь", "info:help:menu")],
     )
@@ -1198,6 +1416,11 @@ active_jobs = {}   # user_id -> asyncio.Task
 stop_events = {}   # user_id -> asyncio.Event
 WORK_LOCK = asyncio.Lock()  # перенос идёт по одному плейлисту за раз
 queue_ids = []     # кто ждёт очереди
+single_wait = set()     # кто сейчас должен прислать запрос для поиска одного трека
+single_results = {}     # user_id -> список найденных в Яндексе вариантов
+single_busy = set()     # у кого уже идёт поиск одного трека
+single_query = {}       # user_id -> последний текстовый запрос
+single_raw = {}         # user_id -> результаты прямого поиска на сайтах
 
 # старый формат: music.yandex.ru/users/ЛОГИН/playlists/НОМЕР
 LINK_RE = re.compile(
@@ -1423,6 +1646,220 @@ async def start_job(chat_id, user_id, start, end, picks=None):
     active_jobs[user_id] = asyncio.create_task(run_job(chat_id, user_id, start, end, picks))
 
 
+# ---------- поиск одного трека ----------
+def raw_list_view(user_id, note=""):
+    results = single_raw.get(user_id) or []
+    rows = []
+    for i, r in enumerate(results):
+        label = f"{'⚠️ ' if r['bad'] else ''}{r['src']} · {r['title']} · {fmt_dur(r['duration'])}"
+        rows.append([btn(label[:58], f"rw:{i}")])
+    rows.append([btn("🔍 Другой запрос", "single"), btn("🏠 Меню", "back:menu")])
+    text = (
+        f"{note}🌐 <b>Результаты с сайтов</b>\n"
+        "Здесь нет сверки с каталогом, поэтому выбирайте по названию и длительности. "
+        "⚠️ означает пометку вроде remix, cover или «ускоренный»."
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def show_raw(msg, user_id, query, note=""):
+    """Прямой поиск на сайтах и показ результатов в сообщении msg."""
+    try:
+        await msg.edit_text("🔎 Ищу на SoundCloud и YouTube...")
+    except Exception:
+        pass
+    try:
+        results = await asyncio.to_thread(raw_search, query)
+    except Exception as e:
+        logging.warning(f"Прямой поиск не удался: {e}")
+        results = []
+    single_raw[user_id] = results
+    if not results:
+        try:
+            await msg.edit_text(
+                f"{note}😕 На сайтах ничего подходящего не нашлось. Проверьте написание "
+                "или попробуйте другой запрос.",
+                reply_markup=kb([btn("🔍 Искать снова", "single")], [btn("🏠 Меню", "back:menu")]),
+            )
+        except Exception:
+            pass
+        return
+    text, markup = raw_list_view(user_id, note)
+    try:
+        await msg.edit_text(text, reply_markup=markup)
+    except Exception:
+        pass
+
+
+async def do_single_search(message, query):
+    user_id = message.from_user.id
+    single_wait.discard(user_id)
+    query = (query or "").strip()
+    if len(query) < 2:
+        await message.answer("Напишите исполнителя и название, например: <code>Исполнитель - Название</code>")
+        single_wait.add(user_id)
+        return
+    single_query[user_id] = query
+    wait = await message.answer("🔎 Ищу в каталогах (Яндекс Музыка, Deezer)...")
+    try:
+        results = await asyncio.to_thread(catalog_search, query)
+    except Exception as e:
+        logging.warning(f"Поиск в каталогах не удался: {e}")
+        results = []
+    if not results:
+        await show_raw(wait, user_id, query, "В каталогах трек не найден, поэтому ищу напрямую.\n\n")
+        return
+    single_results[user_id] = results
+    rows = [
+        [btn(f"{r['artists']} — {r['title']} · {fmt_dur(r['duration'])}"[:58], f"st:{i}")]
+        for i, r in enumerate(results)
+    ]
+    rows.append([btn("🌐 Нет нужного: искать на сайтах", "raw")])
+    rows.append([btn("🔍 Другой запрос", "single"), btn("🏠 Меню", "back:menu")])
+    await wait.edit_text(
+        "🎯 <b>Выберите нужный трек</b>\n"
+        "В скобках длительность: по ней бот проверяет, что найдена та же версия. "
+        "Если трека нет в списке, нажмите «искать на сайтах».",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+async def single_job(chat_id, user_id, index, relaxed):
+    results = single_results.get(user_id) or []
+    if index < 0 or index >= len(results):
+        await bot.send_message(
+            chat_id, "Список устарел. Начните поиск заново.",
+            reply_markup=kb([btn("🔍 Найти трек", "single")]),
+        )
+        return
+    if user_id in single_busy:
+        await bot.send_message(chat_id, "⏳ Предыдущий поиск ещё идёт, подождите немного.")
+        return
+    single_busy.add(user_id)
+    item = results[index]
+    label = html.escape(f"{item['artists']} — {item['title']}")
+    cover = file_path = None
+    status = None
+    try:
+        if WORK_LOCK.locked():
+            status = await bot.send_message(
+                chat_id, f"⏳ Сейчас идёт другой перенос. Вы в очереди, начну сам.\n🎵 {label}"
+            )
+        else:
+            status = await bot.send_message(chat_id, f"🔎 Ищу лучшую версию...\n🎵 {label}")
+        async with WORK_LOCK:
+            await safe_edit(
+                chat_id, status.message_id,
+                f"🔎 <b>Ищу лучшую версию</b>\n🎵 {label}\n\n<i>Это может занять до пары минут.</i>",
+            )
+            title, artists, cover, duration = await asyncio.to_thread(
+                with_retry, catalog_track_info, item
+            )
+            file_path, note = await asyncio.to_thread(
+                download_track_public, artists, title, duration, relaxed
+            )
+            if file_path:
+                await send_audio_retry(
+                    chat_id, file_path, title, artists, cover,
+                    f"⚠️ {html.escape(note)}" if note else None,
+                )
+                text = "✅ <b>Готово!</b>"
+                if note:
+                    text += f"\n⚠️ {html.escape(note)}"
+                await safe_edit(
+                    chat_id, status.message_id, text,
+                    kb([btn("🔍 Найти ещё", "single"), btn("🏠 Меню", "back:menu")]),
+                )
+            else:
+                rows = []
+                text = (
+                    f"🔍 <b>Точного совпадения не нашла</b>\n🎵 {label}\n\n"
+                    "Не нашлось версии с тем же исполнителем и почти той же длительностью."
+                )
+                if not relaxed:
+                    text += "\nМожно показать похожие варианты: они будут подписаны ⚠️."
+                    rows.append([btn("🌐 Показать похожие", f"str:{index}")])
+                if yt_is_blocked():
+                    text += "\n\nℹ️ YouTube сейчас не отвечает серверу бота, поэтому поиск мог быть неполным."
+                rows.append([btn("🔍 Найти другой", "single"), btn("🏠 Меню", "back:menu")])
+                await safe_edit(
+                    chat_id, status.message_id, text, InlineKeyboardMarkup(inline_keyboard=rows)
+                )
+    except Exception as e:
+        logging.exception("Ошибка поиска одного трека")
+        if status:
+            await safe_edit(
+                chat_id, status.message_id, f"❌ Ошибка: {html.escape(str(e))[:200]}",
+                kb([btn("🔍 Найти ещё", "single"), btn("🏠 Меню", "back:menu")]),
+            )
+    finally:
+        for p_ in (file_path, cover):
+            if p_ and os.path.exists(p_):
+                os.remove(p_)
+        single_busy.discard(user_id)
+        trim_memory()
+
+
+async def raw_job(chat_id, user_id, index):
+    results = single_raw.get(user_id) or []
+    if index < 0 or index >= len(results):
+        await bot.send_message(
+            chat_id, "Список устарел. Начните поиск заново.",
+            reply_markup=kb([btn("🔍 Найти трек", "single")]),
+        )
+        return
+    if user_id in single_busy:
+        await bot.send_message(chat_id, "⏳ Предыдущий поиск ещё идёт, подождите немного.")
+        return
+    single_busy.add(user_id)
+    item = results[index]
+    label = html.escape(item["title"])
+    cover = file_path = None
+    status = None
+    try:
+        if WORK_LOCK.locked():
+            status = await bot.send_message(
+                chat_id, f"⏳ Сейчас идёт другой перенос. Вы в очереди, начну сам.\n🎵 {label}"
+            )
+        else:
+            status = await bot.send_message(chat_id, f"⬇️ Скачиваю...\n🎵 {label}")
+        async with WORK_LOCK:
+            await safe_edit(chat_id, status.message_id, f"⬇️ <b>Скачиваю</b>\n🎵 {label}")
+            file_path = await asyncio.to_thread(download_url, item["url"])
+            if not file_path:
+                await safe_edit(
+                    chat_id, status.message_id,
+                    f"😕 Не получилось скачать этот вариант (возможно, он защищён или недоступен).\n🎵 {label}",
+                    kb([btn("⬅️ К списку", "rawlist")], [btn("🏠 Меню", "back:menu")]),
+                )
+                return
+            title, artist = split_artist_title(item["title"], item["uploader"])
+            # официальная обложка из Deezer, если трек там нашёлся и совпал; иначе обложка источника
+            cover_url = await asyncio.to_thread(official_cover_url, item["title"], item["duration"])
+            official = bool(cover_url)
+            cover_url = cover_url or item.get("thumb")
+            cover = await asyncio.to_thread(prepare_cover, cover_url, f"raw{user_id}")
+            await send_audio_retry(chat_id, file_path, title, artist, cover, None)
+            note = "обложка из каталога Deezer" if official else "обложка с сайта-источника"
+            await safe_edit(
+                chat_id, status.message_id, f"✅ <b>Готово!</b>\n<i>Источник: {item['src']}, {note}.</i>",
+                kb([btn("🔍 Найти ещё", "single"), btn("🏠 Меню", "back:menu")]),
+            )
+    except Exception as e:
+        logging.exception("Ошибка прямого скачивания")
+        if status:
+            await safe_edit(
+                chat_id, status.message_id, f"❌ Ошибка: {html.escape(str(e))[:200]}",
+                kb([btn("⬅️ К списку", "rawlist"), btn("🏠 Меню", "back:menu")]),
+            )
+    finally:
+        for p_ in (file_path, cover):
+            if p_ and os.path.exists(p_):
+                os.remove(p_)
+        single_busy.discard(user_id)
+        trim_memory()
+
+
 # ---------- команды ----------
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
@@ -1443,6 +1880,16 @@ async def cmd_stop(message: Message):
         await message.answer("⏹ Останавливаю после текущего трека...")
     else:
         await message.answer("Сейчас нет активного переноса.")
+
+
+@dp.message(Command("find"))
+async def cmd_find(message: Message):
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) > 1:
+        await do_single_search(message, parts[1])
+    else:
+        single_wait.add(message.from_user.id)
+        await message.answer(SINGLE_PROMPT, reply_markup=back_kb("menu"))
 
 
 @dp.message(Command("diag"))
@@ -1481,6 +1928,7 @@ async def on_callback(cb: CallbackQuery):
         await show(INFO_TEXTS.get(key, "—"), back_kb(back))
 
     elif data.startswith("back:"):
+        single_wait.discard(user_id)
         back = data.split(":")[1]
         session = sessions.get(user_id)
         if back == "card" and session:
@@ -1530,6 +1978,7 @@ async def on_callback(cb: CallbackQuery):
             await show("Сессия устарела. Отправьте ссылку на плейлист заново.", menu_kb())
             return
         session["awaiting_range"] = True
+        single_wait.discard(user_id)
         await show(
             f"✏️ <b>Свой диапазон</b>\n\n"
             f"В плейлисте {session['total']} треков. Отправьте номера, например:\n"
@@ -1538,6 +1987,52 @@ async def on_callback(cb: CallbackQuery):
             "<code>10</code> — первые 10 треков",
             kb([btn("⬅️ Назад", "back:card")]),
         )
+
+    elif data == "single":
+        single_wait.add(user_id)
+        session = sessions.get(user_id)
+        if session:
+            session["awaiting_range"] = False
+        await show(SINGLE_PROMPT, back_kb("menu"))
+
+    elif data == "raw":
+        query = single_query.get(user_id)
+        if not query:
+            await show(SINGLE_PROMPT, back_kb("menu"))
+            single_wait.add(user_id)
+            return
+        await show_raw(message, user_id, query)
+
+    elif data == "rawlist":
+        if single_raw.get(user_id):
+            text, markup = raw_list_view(user_id)
+            await show(text, markup)
+        else:
+            await show(SINGLE_PROMPT, back_kb("menu"))
+            single_wait.add(user_id)
+
+    elif data.startswith("rw:"):
+        try:
+            index = int(data.split(":")[1])
+        except ValueError:
+            return
+        try:
+            await message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        asyncio.create_task(raw_job(message.chat.id, user_id, index))
+
+    elif data.startswith("st:") or data.startswith("str:"):
+        relaxed = data.startswith("str:")
+        try:
+            index = int(data.split(":")[1])
+        except ValueError:
+            return
+        try:
+            await message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        asyncio.create_task(single_job(message.chat.id, user_id, index, relaxed))
 
     elif data == "stop":
         task = active_jobs.get(user_id)
@@ -1553,6 +2048,7 @@ async def on_callback(cb: CallbackQuery):
 # ---------- обработка ссылок и текста ----------
 async def handle_link(message: Message, login=None, kind=None, uuid=None):
     user_id = message.from_user.id
+    single_wait.discard(user_id)
     wait = await message.answer("🔎 Открываю плейлист...")
     try:
         title, tracks, declared = await asyncio.to_thread(
@@ -1607,6 +2103,10 @@ async def on_text(message: Message):
         )
         return
 
+    if user_id in single_wait:
+        await do_single_search(message, text)
+        return
+
     session = sessions.get(user_id)
     if session and session.get("awaiting_range"):
         selection = parse_selection(text, session["total"])
@@ -1621,8 +2121,8 @@ async def on_text(message: Message):
         return
 
     await message.answer(
-        "Отправьте ссылку на плейлист из Яндекс Музыки или откройте меню 👇",
-        reply_markup=kb([btn("🏠 Меню", "back:menu")]),
+        "Отправьте ссылку на плейлист из Яндекс Музыки или найдите один трек 👇",
+        reply_markup=kb([btn("🔍 Найти один трек", "single")], [btn("🏠 Меню", "back:menu")]),
     )
 
 
@@ -1633,6 +2133,7 @@ async def setup_bot_profile():
             [
                 BotCommand(command="start", description="Главное меню"),
                 BotCommand(command="help", description="Помощь и как получить ссылку"),
+                BotCommand(command="find", description="Найти один трек"),
                 BotCommand(command="stop", description="Остановить перенос"),
             ]
         )
