@@ -1,6 +1,7 @@
 import os
 import gc
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 import urllib.parse
 import re
 import io
@@ -880,9 +881,10 @@ def is_mostly_latin(text):
 def search_candidates(query, artist_words, first_artist_words, title_core_words, title_full_words, orig_duration,
                       artists_text="", first_artist_text=""):
     """
-    Ищет по запросу. Возвращает два списка кандидатов:
-    точные (оценка, разница_длительности, результат) и
-    запасные (оценка, разница_длительности, результат, причина, есть_пометка_ремикса).
+    Ищет по запросу. Возвращает два списка кандидатов и статистику:
+    точные (оценка, разница_длительности, результат),
+    запасные (оценка, разница_длительности, результат, причина, есть_пометка_ремикса)
+    и словарь с числом найденных результатов и причин отбраковки (для подсказок пользователю).
     """
     opts = {
         "quiet": True,
@@ -901,14 +903,16 @@ def search_candidates(query, artist_words, first_artist_words, title_core_words,
         opts["extract_flat"] = True  # быстро и без проверки форматов каждого видео
         use_warp(opts, True)
     strict, relaxed = [], []
+    stats = {"found": 0, "rej_dur": 0, "rej_artist": 0, "rej_title": 0}
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(query, download=False)
         if not info:
             logging.info("   поиск ничего не вернул (источник мог отказать или результатов нет)")
-            return strict, relaxed
+            return strict, relaxed, stats
         entries = [e for e in (info.get("entries") or []) if e]
-        logging.info(f"   найдено результатов: {len(entries)}")
+        stats["found"] = len(entries)
+        logging.info(f"   [{query[:40]}] найдено результатов: {len(entries)}")
         if entries and query.startswith("ytsearch"):
             yt_success()
         for entry in entries:
@@ -920,6 +924,7 @@ def search_candidates(query, artist_words, first_artist_words, title_core_words,
             if found_duration and orig_duration:
                 diff = abs(found_duration - orig_duration)
                 if diff > RELAXED_DURATION_DIFF:
+                    stats["rej_dur"] += 1
                     logging.info(
                         f"   отброшен: '{entry.get('title')}' длительность отличается на {diff:.0f} с"
                     )
@@ -938,8 +943,10 @@ def search_candidates(query, artist_words, first_artist_words, title_core_words,
             )
 
             if title_part < 0.6:
+                stats["rej_title"] += 1
                 continue
             if not artist_ok:
+                stats["rej_artist"] += 1
                 logging.info("      отброшен: исполнитель не подтверждён")
                 continue
 
@@ -957,7 +964,7 @@ def search_candidates(query, artist_words, first_artist_words, title_core_words,
     except Exception as e:
         logging.warning(f"Ошибка поиска '{query}': {e}")
     strict.sort(key=lambda x: x[0], reverse=True)
-    return strict, relaxed
+    return strict, relaxed, stats
 
 
 def download_url(url):
@@ -999,8 +1006,9 @@ def download_url(url):
 def download_track_public(artists, title, orig_duration=None, allow_relaxed=True):
     """
     Главная функция: ищет лучший вариант трека и скачивает его.
-    Возвращает (путь к файлу или None, предупреждение или None).
+    Возвращает (путь к файлу или None, предупреждение или None, подсказка почему не найдено или None).
     allow_relaxed=False («точный» режим): сомнительные варианты не отправляются совсем.
+    Все поисковые запросы выполняются одновременно, поэтому ненайденный трек не съедает минуты.
     """
     logging.info(f"Ищу: {artists} — {title} (длительность {orig_duration}, сомнительные: {allow_relaxed})")
     first_artist = artists.split(",")[0].strip()
@@ -1015,8 +1023,7 @@ def download_track_public(artists, title, orig_duration=None, allow_relaxed=True
     title_core_words = norm_words(title_core)
     title_full_words = norm_words(title)
 
-    # варианты запроса без повторов; SoundCloud сейчас основной рабочий источник,
-    # поэтому для него пробуем три формулировки
+    # варианты запроса без повторов
     query_texts = []
     variants = [
         f"{artists} - {title}",
@@ -1037,57 +1044,77 @@ def download_track_public(artists, title, orig_duration=None, allow_relaxed=True
     # для YouTube второй запрос выводит автоматические «Topic»-каналы с оригиналами
     yt_texts = query_texts[:1] + [f"{first_artist} {title_core} topic"]
 
-    sources = [("scsearch8", query_texts), ("ytsearch4", yt_texts)]
-    # зарубежные треки на YouTube находятся заметно лучше, но только если YouTube не блокирует сервер
-    if is_mostly_latin(f"{artists} {title}") and not yt_is_blocked():
-        sources.reverse()
-    relaxed_pool = {}
+    queries = [f"scsearch8:{t}" for t in query_texts]
+    if not yt_is_blocked():
+        queries += [f"ytsearch4:{t}" for t in yt_texts]
 
-    # общий лимит времени на один трек, чтобы бот не зависал на ненайденных
     deadline = time.time() + TRACK_TIME_LIMIT
+    strict_pool, relaxed_pool = {}, {}
+    totals = {"found": 0, "rej_dur": 0, "rej_artist": 0, "rej_title": 0}
 
-    for source, texts in sources:
-        for text in texts:
-            if time.time() > deadline:
-                logging.info(f"Лимит времени на трек ({TRACK_TIME_LIMIT} с) исчерпан")
-                break
-            if source.startswith("ytsearch") and yt_is_blocked():
-                logging.info("YouTube сейчас блокирует сервер, пропускаю")
-                break
-            query = f"{source}:{text}"
-            logging.info(f"Запрос: {query}")
-            strict, relaxed = search_candidates(
-                query, artist_words, first_artist_words, title_core_words, title_full_words, orig_duration,
-                artists, first_artist,
-            )
+    # --- поиск: все запросы одновременно ---
+    pool_exec = ThreadPoolExecutor(max_workers=4)
+    futures = [
+        pool_exec.submit(
+            search_candidates, q, artist_words, first_artist_words, title_core_words,
+            title_full_words, orig_duration, artists, first_artist,
+        )
+        for q in queries
+    ]
+    try:
+        for fut in as_completed(futures, timeout=max(5, deadline - time.time())):
+            try:
+                strict, relaxed, stats = fut.result()
+            except Exception as e:
+                logging.warning(f"Сбой запроса: {e}")
+                continue
+            for k in totals:
+                totals[k] += stats.get(k, 0)
+            for cand in strict:
+                url = cand[2].get("webpage_url") or cand[2].get("url")
+                if url and url not in strict_pool:
+                    strict_pool[url] = cand
             for cand in relaxed:
                 url = cand[2].get("webpage_url") or cand[2].get("url")
                 if url and url not in relaxed_pool:
                     relaxed_pool[url] = cand
-            # пробуем скачать до 3 лучших точных результатов
-            for score, diff, entry in strict[:2]:
-                url = entry.get("webpage_url") or entry.get("url")
-                if not url:
-                    continue
-                logging.info(f"Выбран: '{entry.get('title')}' (оценка {score:.2f})")
-                path = download_url(url)
-                if path:
-                    return path, None
+    except FuturesTimeout:
+        logging.info(f"Лимит времени на поиск ({TRACK_TIME_LIMIT} с) исчерпан")
+    finally:
+        pool_exec.shutdown(wait=False, cancel_futures=True)
 
-    # запасной вариант (только в режиме «максимум»): заметная разница длительности или пометка ремикса
-    if not allow_relaxed:
-        return None, None
-    pool = sorted(relaxed_pool.values(), key=lambda c: (c[4], c[1], -c[0]))
-    for score, diff, entry, reason, is_bad in pool[:2]:
-        if time.time() > deadline + 60:
-            break
-        url = entry.get("webpage_url") or entry.get("url")
-        logging.info(f"Запасной вариант: '{entry.get('title')}' ({reason})")
+    # --- скачивание лучших точных вариантов ---
+    best = sorted(strict_pool.items(), key=lambda kv: kv[1][0], reverse=True)
+    for url, (score, diff, entry) in best[:3]:
+        logging.info(f"Выбран: '{entry.get('title')}' (оценка {score:.2f})")
         path = download_url(url)
         if path:
-            return path, f"{reason}, возможно другая версия"
+            return path, None, None
 
-    return None, None
+    # --- запасной вариант (только в режиме «максимум») ---
+    if relaxed_pool and allow_relaxed:
+        pool = sorted(relaxed_pool.values(), key=lambda c: (c[4], c[1], -c[0]))
+        for score, diff, entry, reason, is_bad in pool[:2]:
+            url = entry.get("webpage_url") or entry.get("url")
+            logging.info(f"Запасной вариант: '{entry.get('title')}' ({reason})")
+            path = download_url(url)
+            if path:
+                return path, f"{reason}, возможно другая версия", None
+
+    # --- подсказка, почему не нашлось ---
+    if strict_pool or (relaxed_pool and allow_relaxed):
+        hint = "варианты нашлись, но скачать не удалось (защита или ошибка источника)"
+    elif relaxed_pool:
+        hint = "есть похожий вариант с другой длительностью или пометкой, режим «максимум» может его найти"
+    elif totals["rej_artist"] and not totals["rej_dur"]:
+        hint = "трек с таким названием есть, но исполнитель не совпал"
+    elif totals["rej_dur"]:
+        hint = "найдены версии с сильно другой длительностью"
+    elif totals["found"] == 0:
+        hint = "источники ничего не вернули" + (" (YouTube недоступен)" if yt_is_blocked() else "")
+    else:
+        hint = "подходящих вариантов не нашлось"
+    return None, None, hint
 
 
 # ---------- диагностика источников (команда /diag) ----------
@@ -1466,8 +1493,9 @@ async def send_audio_retry(chat_id, file_path, title, artists, cover, caption):
     raise last_error
 
 
-async def run_job(chat_id, user_id, start, end, picks=None):
-    """picks: список номеров треков (для случайной проверки); иначе берётся диапазон start–end."""
+async def run_job(chat_id, user_id, start, end, picks=None, kind=None):
+    """picks: список номеров треков (случайная проверка или повтор); иначе берётся диапазон start–end.
+    kind="retry": повторный поиск не найденных треков в режиме «максимум»."""
     session = sessions.get(user_id)
     if not session:
         await bot.send_message(chat_id, "Сессия устарела. Отправьте ссылку на плейлист заново.")
@@ -1476,7 +1504,7 @@ async def run_job(chat_id, user_id, start, end, picks=None):
     stop_event = stop_events[user_id]
     numbers = list(picks) if picks else list(range(start, end + 1))
     selected = [session["tracks"][n - 1] for n in numbers]
-    allow_relaxed = session.get("mode", "exact") == "max"
+    allow_relaxed = session.get("mode", "exact") == "max" or kind == "retry"
     count = len(selected)
     total_all = session["total"]
     title_escaped = html.escape(session["title"])
@@ -1495,6 +1523,7 @@ async def run_job(chat_id, user_id, start, end, picks=None):
         status = await bot.send_message(chat_id, "🚀 Запускаю перенос...", reply_markup=STOP_KB)
 
     ok, failed, flagged = 0, [], []
+    relaxable = []   # номера треков, которые может найти режим «максимум»
     last_done = numbers[0] - 1 if numbers else start - 1
     processed = 0
     stopped = False
@@ -1518,7 +1547,9 @@ async def run_job(chat_id, user_id, start, end, picks=None):
                         with_retry, yandex_track_info, short_track
                     )
 
-                    if picks:
+                    if kind == "retry":
+                        where = f"🌐 Повтор в режиме максимум: трек №{number} ({offset + 1} из {count})"
+                    elif picks:
                         where = f"🎲 Случайная проверка: трек №{number} ({offset + 1} из {count})"
                     else:
                         where = f"Трек <b>{number}</b> из {end} (часть {start}–{end})"
@@ -1536,7 +1567,7 @@ async def run_job(chat_id, user_id, start, end, picks=None):
                         reply_markup=STOP_KB,
                     )
 
-                    file_path, note = await asyncio.to_thread(
+                    file_path, note, hint = await asyncio.to_thread(
                         download_track_public, artists, title, duration, allow_relaxed
                     )
                     if file_path:
@@ -1552,7 +1583,9 @@ async def run_job(chat_id, user_id, start, end, picks=None):
                         if note:
                             flagged.append(f"№{number}: {artists} — {title} ({note})")
                     else:
-                        failed.append(f"№{number}: {artists} — {title}")
+                        failed.append(f"№{number}: {artists} — {title} ({hint})" if hint else f"№{number}: {artists} — {title}")
+                        if hint and "режим «максимум»" in hint:
+                            relaxable.append(number)
                 except Exception as e:
                     logging.exception("Ошибка на треке")
                     failed.append(f"№{number}: {artists or 'трек'} {title} (ошибка: {e})")
@@ -1580,6 +1613,9 @@ async def run_job(chat_id, user_id, start, end, picks=None):
     if stopped:
         await safe_edit(chat_id, status.message_id, f"⏹ Перенос остановлен на треке №{last_done}.")
         header = f"⏹ <b>Остановлено</b> на №{last_done}"
+    elif kind == "retry":
+        await safe_edit(chat_id, status.message_id, "✅ Повторный поиск завершён.")
+        header = "🌐 <b>Повтор в режиме максимум готов</b>"
     elif picks:
         await safe_edit(chat_id, status.message_id, "✅ Случайная проверка обработана.")
         header = "🎲 <b>Случайная проверка готова</b>"
@@ -1616,7 +1652,12 @@ async def run_job(chat_id, user_id, start, end, picks=None):
         lines.append("\n📎 Подробный список в файле ниже.")
 
     rows = []
-    if picks:
+    if relaxable and not allow_relaxed:
+        session["retry"] = list(relaxable)
+        rows.append([btn(f"🌐 Повторить {len(relaxable)} в режиме максимум", "retry")])
+    if kind == "retry":
+        rows.append([btn("⬅️ К плейлисту", "back:card")])
+    elif picks:
         rows.append([btn("🎲 Ещё случайные", "rand")])
     elif stopped and last_done < end:
         rows.append([btn(f"▶️ Продолжить с №{last_done + 1}", f"run:{last_done + 1}-{end}")])
@@ -1637,13 +1678,13 @@ async def run_job(chat_id, user_id, start, end, picks=None):
         )
 
 
-async def start_job(chat_id, user_id, start, end, picks=None):
+async def start_job(chat_id, user_id, start, end, picks=None, kind=None):
     task = active_jobs.get(user_id)
     if task and not task.done():
         await bot.send_message(chat_id, "⏳ Перенос уже идёт. Остановить его можно командой /stop.")
         return
     stop_events[user_id] = asyncio.Event()
-    active_jobs[user_id] = asyncio.create_task(run_job(chat_id, user_id, start, end, picks))
+    active_jobs[user_id] = asyncio.create_task(run_job(chat_id, user_id, start, end, picks, kind))
 
 
 # ---------- поиск одного трека ----------
@@ -1755,7 +1796,7 @@ async def single_job(chat_id, user_id, index, relaxed):
             title, artists, cover, duration = await asyncio.to_thread(
                 with_retry, catalog_track_info, item
             )
-            file_path, note = await asyncio.to_thread(
+            file_path, note, hint = await asyncio.to_thread(
                 download_track_public, artists, title, duration, relaxed
             )
             if file_path:
@@ -1774,7 +1815,7 @@ async def single_job(chat_id, user_id, index, relaxed):
                 rows = []
                 text = (
                     f"🔍 <b>Точного совпадения не нашла</b>\n🎵 {label}\n\n"
-                    "Не нашлось версии с тем же исполнителем и почти той же длительностью."
+                    f"Причина: {html.escape(hint or 'нет подходящих вариантов')}."
                 )
                 if not relaxed:
                     text += "\nМожно показать похожие варианты: они будут подписаны ⚠️."
@@ -1963,6 +2004,18 @@ async def on_callback(cb: CallbackQuery):
         except Exception:
             pass
         await start_job(message.chat.id, user_id, 1, 1, picks)
+
+    elif data == "retry":
+        session = sessions.get(user_id)
+        numbers = (session or {}).get("retry")
+        if not numbers:
+            await show("Список для повтора устарел. Отправьте ссылку на плейлист заново.", menu_kb())
+            return
+        try:
+            await message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await start_job(message.chat.id, user_id, 1, 1, list(numbers), "retry")
 
     elif data == "mode":
         session = sessions.get(user_id)
