@@ -559,11 +559,12 @@ def yandex_get_playlist(token, login=None, kind=None, uuid=None):
         else:
             tid = getattr(item, "track_id", None) or str(base)
         tracks.append(str(tid))
+    playlist_kind = getattr(playlist, "kind", None)
     del candidates, best, playlist
     trim_memory()
 
     # «Мне нравится» (kind=3): Яндекс отдаёт от новых к старым, разворачиваем
-    if getattr(playlist, "kind", None) == 3 and LIKES_OLDEST_FIRST:
+    if playlist_kind == 3 and LIKES_OLDEST_FIRST:
         tracks.reverse()
     return title, tracks, declared
 
