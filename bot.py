@@ -1019,7 +1019,7 @@ def search_candidates(query, artist_words, first_artist_words, title_core_words,
 def download_url(url):
     """Скачивает конкретную ссылку и возвращает путь к mp3 или None."""
     is_youtube = "youtube.com" in url or "youtu.be" in url
-    opts = {
+    base = {
         "format": "bestaudio/best",
         "postprocessors": [
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
@@ -1030,29 +1030,95 @@ def download_url(url):
         "noprogress": True,
         "socket_timeout": 30,
         "noplaylist": True,
-        "logger": YtLogger(is_youtube),
     }
     if COOKIE_FILE:
-        opts["cookiefile"] = COOKIE_FILE
-    opts.update(JS_OPTS)
-    use_warp(opts, is_youtube)
+        base["cookiefile"] = COOKIE_FILE
+    base.update(JS_OPTS)
+    use_warp(base, is_youtube)
     if "soundcloud.com" in url and sc_via_warp():
-        opts["proxy"] = WARP_PROXY
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if not info:
-                return None
-            mp3 = os.path.splitext(ydl.prepare_filename(info))[0] + ".mp3"
-            if os.path.exists(mp3):
-                if is_youtube:
-                    yt_success()
-                return mp3
-    except Exception as e:
-        note_sc_error(e)
-        if not note_yt_error(e, is_youtube):
-            logging.warning(f"Ошибка скачивания {url}: {e}")
+        base["proxy"] = WARP_PROXY
+
+    # YouTube: если стандартный способ не сработал (часто 403), пробуем другие «клиенты» YouTube.
+    # Ошибки в счётчик блокировки идут только если не вышло ни одним способом.
+    attempts = [(None, "стандартный")]
+    if is_youtube:
+        attempts += [
+            ({"youtube": {"player_client": ["android_vr"]}}, "android_vr"),
+            ({"youtube": {"player_client": ["ios"]}}, "ios"),
+        ]
+    last_error = None
+    for extractor_args, label in attempts:
+        opts = dict(base)
+        opts["logger"] = YtLogger(False)
+        if extractor_args:
+            opts["extractor_args"] = extractor_args
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if not info:
+                    continue
+                mp3 = os.path.splitext(ydl.prepare_filename(info))[0] + ".mp3"
+                if os.path.exists(mp3):
+                    if is_youtube:
+                        yt_success()
+                        logging.info(f"YouTube скачан способом: {label}")
+                    return mp3
+        except Exception as e:
+            last_error = e
+            note_sc_error(e)
+            text = str(e)
+            # не тратим попытки на заведомо безнадёжное
+            if not is_youtube or "Sign in to confirm" in text or "not a bot" in text:
+                break
+            logging.info(f"YouTube, способ «{label}» не сработал: {text[:120]}")
+    if last_error is not None:
+        if not note_yt_error(last_error, is_youtube):
+            logging.warning(f"Ошибка скачивания {url}: {last_error}")
     return None
+
+
+def deep_search_track(artists, title, orig_duration):
+    """
+    «Глубокий» поиск ненайденного трека: так же, как работает поиск одного трека на сайтах.
+    Проверки мягче (длительность до ±90 с, исполнитель не обязан быть в названии файла),
+    лучшие варианты присылаются сразу по нескольку с пометкой ⚠️. Возвращает список (путь, пометка).
+    """
+    first_artist = artists.split(",")[0].strip()
+    title_core = re.sub(r"[\(\[].*?[\)\]]", " ", title).strip() or title
+    texts = [f"{first_artist} {title_core}"]
+    latin = translit_text(texts[0])
+    if latin:
+        texts.append(latin)
+    texts.append(f"{artists} {title_core}")
+    cands = {}
+    for t in texts:
+        try:
+            for r in raw_search(t):
+                cands.setdefault(r["url"], r)
+        except Exception as e:
+            logging.warning(f"Глубокий поиск '{t}': {e}")
+        if len(cands) >= 4:
+            break
+    items = list(cands.values())
+    for r in items:
+        r["diff"] = abs(r["duration"] - orig_duration) if (r["duration"] and orig_duration) else None
+    items = [r for r in items if r["diff"] is None or r["diff"] <= 90]
+    items.sort(key=lambda r: (r["bad"], r["diff"] if r["diff"] is not None else 45, -r["rel"]))
+    found = []
+    for r in items[:8]:
+        if len(found) >= MAX_VARIANTS:
+            break
+        logging.info(f"Глубокий поиск, пробую: '{r['title']}' ({r['uploader']}) {r['src']}")
+        path = download_url(r["url"])
+        if path:
+            note = f"глубокий поиск ({r['src']}): {r['title']} ({r['uploader']}), {fmt_dur(r['duration'])}"
+            if r["diff"] is not None:
+                note += f", разница с Яндексом {r['diff']:.0f} с"
+            if r["bad"]:
+                note += ", в названии есть пометка remix/cover/ускорено"
+            found.append((path, note))
+    n = len(found)
+    return [(p, f"вариант {i + 1} из {n}: {t}" if n > 1 else t) for i, (p, t) in enumerate(found)]
 
 
 def download_track_public(artists, title, orig_duration=None, allow_relaxed=True):
@@ -1155,7 +1221,7 @@ def download_track_public(artists, title, orig_duration=None, allow_relaxed=True
 
     # --- скачивание лучших точных вариантов ---
     best = sorted(strict_pool.items(), key=lambda kv: kv[1][0], reverse=True)
-    for url, (score, diff, entry) in best[:3]:
+    for url, (score, diff, entry) in best[:8]:
         logging.info(f"Выбран: '{entry.get('title')}' (оценка {score:.2f})")
         path = download_url(url)
         if path:
@@ -1633,7 +1699,7 @@ async def run_job(chat_id, user_id, start, end, picks=None, kind=None):
                     )
 
                     if kind == "retry":
-                        where = f"🌐 Повтор в режиме максимум: трек №{number} ({offset + 1} из {count})"
+                        where = f"🔎 Глубокий поиск: трек №{number} ({offset + 1} из {count})"
                     elif picks:
                         where = f"🎲 Случайная проверка: трек №{number} ({offset + 1} из {count})"
                     else:
@@ -1655,6 +1721,12 @@ async def run_job(chat_id, user_id, start, end, picks=None, kind=None):
                     files, hint = await asyncio.to_thread(
                         download_track_public, artists, title, duration, allow_relaxed
                     )
+                    if not files and kind == "retry":
+                        files = await asyncio.to_thread(deep_search_track, artists, title, duration)
+                        if files:
+                            hint = None
+                        else:
+                            hint = "глубокий поиск тоже ничего не нашёл"
                     file_paths = [fp for fp, _ in files]
                     if files:
                         for fp, note in files:
@@ -1700,8 +1772,8 @@ async def run_job(chat_id, user_id, start, end, picks=None, kind=None):
         await safe_edit(chat_id, status.message_id, f"⏹ Перенос остановлен на треке №{last_done}.")
         header = f"⏹ <b>Остановлено</b> на №{last_done}"
     elif kind == "retry":
-        await safe_edit(chat_id, status.message_id, "✅ Повторный поиск завершён.")
-        header = "🌐 <b>Повтор в режиме максимум готов</b>"
+        await safe_edit(chat_id, status.message_id, "✅ Глубокий поиск завершён.")
+        header = "🔎 <b>Глубокий поиск готов</b>"
     elif picks:
         await safe_edit(chat_id, status.message_id, "✅ Случайная проверка обработана.")
         header = "🎲 <b>Случайная проверка готова</b>"
@@ -1740,7 +1812,7 @@ async def run_job(chat_id, user_id, start, end, picks=None, kind=None):
     rows = []
     if relaxable and not allow_relaxed:
         session["retry"] = list(relaxable)
-        rows.append([btn(f"🌐 Повторить все {len(relaxable)} в режиме максимум", "retry")])
+        rows.append([btn(f"🔎 Глубокий поиск для всех {len(relaxable)}", "retry")])
     if kind == "retry":
         rows.append([btn("⬅️ К плейлисту", "back:card")])
     elif picks:
@@ -1886,6 +1958,8 @@ async def single_job(chat_id, user_id, index, relaxed):
             files, hint = await asyncio.to_thread(
                 download_track_public, artists, title, duration, relaxed
             )
+            if not files and relaxed:
+                files = await asyncio.to_thread(deep_search_track, artists, title, duration)
             file_paths = [fp for fp, _ in files]
             if files:
                 for fp, note in files:
