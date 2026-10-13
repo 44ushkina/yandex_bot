@@ -153,6 +153,47 @@ def note_yt_error(message, youtube_context=False):
     return False
 
 
+# ---------- защита от блокировки SoundCloud ----------
+# Если SoundCloud начинает отвечать 403 (слишком частые запросы или блокировка адреса),
+# сначала переключаем его на WARP, а если и так не выходит, делаем короткую паузу.
+SC_403_COUNT = 0
+SC_PAUSE_UNTIL = 0.0
+SC_VIA_WARP_UNTIL = 0.0
+
+
+def sc_paused():
+    return time.time() < SC_PAUSE_UNTIL
+
+
+def sc_via_warp():
+    return bool(WARP_PROXY) and time.time() < SC_VIA_WARP_UNTIL
+
+
+def sc_success():
+    global SC_403_COUNT
+    SC_403_COUNT = 0
+
+
+def note_sc_error(message):
+    """Считает ошибки 403 от SoundCloud и при необходимости меняет способ подключения."""
+    global SC_403_COUNT, SC_PAUSE_UNTIL, SC_VIA_WARP_UNTIL
+    text = str(message)
+    if "soundcloud" not in text.lower() or "403" not in text:
+        return False
+    SC_403_COUNT += 1
+    if SC_403_COUNT >= 6:
+        SC_403_COUNT = 0
+        now = time.time()
+        if WARP_PROXY and now >= SC_VIA_WARP_UNTIL:
+            SC_VIA_WARP_UNTIL = now + 30 * 60
+            logging.warning("SoundCloud отвечает 403: переключаю его на WARP на 30 минут")
+        else:
+            SC_PAUSE_UNTIL = now + 3 * 60
+            SC_VIA_WARP_UNTIL = 0.0
+            logging.warning("SoundCloud отвечает 403 и через WARP: пауза 3 минуты")
+    return True
+
+
 class YtLogger:
     """Тихий логгер для yt-dlp: не засоряет логи, но замечает блокировку YouTube."""
 
@@ -169,6 +210,7 @@ class YtLogger:
         pass
 
     def error(self, msg):
+        note_sc_error(msg)
         if not note_yt_error(msg, self.youtube):
             logging.warning(f"yt-dlp: {str(msg)[:200]}")
 
@@ -388,6 +430,9 @@ RELAXED_DURATION_DIFF = 40
 # Сколько секунд максимум искать один трек. Если за это время подходящая версия не найдена,
 # бот переходит к следующему треку. Меньше число: быстрее, но реже находит редкие треки.
 TRACK_TIME_LIMIT = 120
+
+# Сколько похожих вариантов присылать сразу в режиме «максимум», если точного совпадения нет
+MAX_VARIANTS = 3
 
 # Размер одной части при переносе частями
 PART_SIZE = 100
@@ -902,6 +947,8 @@ def search_candidates(query, artist_words, first_artist_words, title_core_words,
     if query.startswith("ytsearch"):
         opts["extract_flat"] = True  # быстро и без проверки форматов каждого видео
         use_warp(opts, True)
+    elif sc_via_warp():
+        opts["proxy"] = WARP_PROXY
     strict, relaxed = [], []
     stats = {"found": 0, "rej_dur": 0, "rej_artist": 0, "rej_title": 0}
     try:
@@ -915,6 +962,8 @@ def search_candidates(query, artist_words, first_artist_words, title_core_words,
         logging.info(f"   [{query[:40]}] найдено результатов: {len(entries)}")
         if entries and query.startswith("ytsearch"):
             yt_success()
+        if entries and query.startswith("scsearch"):
+            sc_success()
         for entry in entries:
             found_duration = entry.get("duration")
             if found_duration and found_duration > 600:
@@ -987,6 +1036,8 @@ def download_url(url):
         opts["cookiefile"] = COOKIE_FILE
     opts.update(JS_OPTS)
     use_warp(opts, is_youtube)
+    if "soundcloud.com" in url and sc_via_warp():
+        opts["proxy"] = WARP_PROXY
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -998,6 +1049,7 @@ def download_url(url):
                     yt_success()
                 return mp3
     except Exception as e:
+        note_sc_error(e)
         if not note_yt_error(e, is_youtube):
             logging.warning(f"Ошибка скачивания {url}: {e}")
     return None
@@ -1006,7 +1058,8 @@ def download_url(url):
 def download_track_public(artists, title, orig_duration=None, allow_relaxed=True):
     """
     Главная функция: ищет лучший вариант трека и скачивает его.
-    Возвращает (путь к файлу или None, предупреждение или None, подсказка почему не найдено или None).
+    Возвращает (список из пар (путь к файлу, предупреждение или None), подсказка почему не найдено).
+    В режиме «максимум» вместо одного сомнительного варианта возвращается до MAX_VARIANTS разных.
     allow_relaxed=False («точный» режим): сомнительные варианты не отправляются совсем.
     Все поисковые запросы выполняются одновременно, поэтому ненайденный трек не съедает минуты.
     """
@@ -1044,40 +1097,57 @@ def download_track_public(artists, title, orig_duration=None, allow_relaxed=True
     # для YouTube второй запрос выводит автоматические «Topic»-каналы с оригиналами
     yt_texts = query_texts[:1] + [f"{first_artist} {title_core} topic"]
 
-    queries = [f"scsearch8:{t}" for t in query_texts]
-    if not yt_is_blocked():
-        queries += [f"ytsearch4:{t}" for t in yt_texts]
+    sc_queries = [f"scsearch8:{t}" for t in query_texts]
+    yt_queries = [f"ytsearch4:{t}" for t in yt_texts]
 
     deadline = time.time() + TRACK_TIME_LIMIT
     strict_pool, relaxed_pool = {}, {}
     totals = {"found": 0, "rej_dur": 0, "rej_artist": 0, "rej_title": 0}
 
-    # --- поиск: все запросы одновременно ---
-    pool_exec = ThreadPoolExecutor(max_workers=4)
-    futures = [
-        pool_exec.submit(
-            search_candidates, q, artist_words, first_artist_words, title_core_words,
-            title_full_words, orig_duration, artists, first_artist,
-        )
-        for q in queries
-    ]
+    def run_queries(qs):
+        """Запросы одного источника идут по очереди (чтобы SoundCloud не отвечал 403 из-за частоты)."""
+        out = []
+        for q in qs:
+            if time.time() > deadline:
+                break
+            if q.startswith("ytsearch") and yt_is_blocked():
+                break
+            if q.startswith("scsearch") and sc_paused():
+                break
+            res = search_candidates(
+                q, artist_words, first_artist_words, title_core_words,
+                title_full_words, orig_duration, artists, first_artist,
+            )
+            out.append(res)
+            if q.startswith("scsearch"):
+                if res[0]:
+                    break  # хороший вариант уже есть, остальные формулировки не нужны
+                time.sleep(0.5)
+        return out
+
+    # --- поиск: SoundCloud и YouTube одновременно, внутри источника по очереди ---
+    pool_exec = ThreadPoolExecutor(max_workers=2)
+    futures = [pool_exec.submit(run_queries, sc_queries)]
+    if not yt_is_blocked():
+        futures.append(pool_exec.submit(run_queries, yt_queries))
     try:
         for fut in as_completed(futures, timeout=max(5, deadline - time.time())):
             try:
-                strict, relaxed, stats = fut.result()
+                batch = fut.result()
             except Exception as e:
                 logging.warning(f"Сбой запроса: {e}")
                 continue
-            for k in totals:
-                totals[k] += stats.get(k, 0)
-            for cand in strict:
-                url = cand[2].get("webpage_url") or cand[2].get("url")
-                if url and url not in strict_pool:
-                    strict_pool[url] = cand
-            for cand in relaxed:
-                url = cand[2].get("webpage_url") or cand[2].get("url")
-                if url and url not in relaxed_pool:
-                    relaxed_pool[url] = cand
+            for strict, relaxed, stats in batch:
+                for k in totals:
+                    totals[k] += stats.get(k, 0)
+                for cand in strict:
+                    url = cand[2].get("webpage_url") or cand[2].get("url")
+                    if url and url not in strict_pool:
+                        strict_pool[url] = cand
+                for cand in relaxed:
+                    url = cand[2].get("webpage_url") or cand[2].get("url")
+                    if url and url not in relaxed_pool:
+                        relaxed_pool[url] = cand
     except FuturesTimeout:
         logging.info(f"Лимит времени на поиск ({TRACK_TIME_LIMIT} с) исчерпан")
     finally:
@@ -1089,17 +1159,28 @@ def download_track_public(artists, title, orig_duration=None, allow_relaxed=True
         logging.info(f"Выбран: '{entry.get('title')}' (оценка {score:.2f})")
         path = download_url(url)
         if path:
-            return path, None, None
+            return [(path, None)], None
 
-    # --- запасной вариант (только в режиме «максимум») ---
+    # --- запасные варианты (только в режиме «максимум»): присылаем сразу несколько ---
     if relaxed_pool and allow_relaxed:
         pool = sorted(relaxed_pool.values(), key=lambda c: (c[4], c[1], -c[0]))
-        for score, diff, entry, reason, is_bad in pool[:2]:
+        found = []
+        for score, diff, entry, reason, is_bad in pool[:5]:
+            if len(found) >= MAX_VARIANTS:
+                break
             url = entry.get("webpage_url") or entry.get("url")
             logging.info(f"Запасной вариант: '{entry.get('title')}' ({reason})")
             path = download_url(url)
             if path:
-                return path, f"{reason}, возможно другая версия", None
+                who = entry.get("uploader") or entry.get("channel") or "?"
+                found.append((path, f"{reason}. Найдено: {entry.get('title')} ({who}), {fmt_dur(entry.get('duration'))}"))
+        if found:
+            total_found = len(found)
+            files = [
+                (path, f"вариант {i + 1} из {total_found}: {note}") if total_found > 1 else (path, note)
+                for i, (path, note) in enumerate(found)
+            ]
+            return files, None
 
     # --- подсказка, почему не нашлось ---
     if strict_pool or (relaxed_pool and allow_relaxed):
@@ -1111,10 +1192,14 @@ def download_track_public(artists, title, orig_duration=None, allow_relaxed=True
     elif totals["rej_dur"]:
         hint = "найдены версии с сильно другой длительностью"
     elif totals["found"] == 0:
-        hint = "источники ничего не вернули" + (" (YouTube недоступен)" if yt_is_blocked() else "")
+        hint = "источники ничего не вернули"
+        if yt_is_blocked():
+            hint += " (YouTube недоступен)"
+        if sc_paused():
+            hint += " (SoundCloud временно недоступен)"
     else:
         hint = "подходящих вариантов не нашлось"
-    return None, None, hint
+    return [], hint
 
 
 # ---------- диагностика источников (команда /diag) ----------
@@ -1523,7 +1608,7 @@ async def run_job(chat_id, user_id, start, end, picks=None, kind=None):
         status = await bot.send_message(chat_id, "🚀 Запускаю перенос...", reply_markup=STOP_KB)
 
     ok, failed, flagged = 0, [], []
-    relaxable = []   # номера треков, которые может найти режим «максимум»
+    relaxable = []   # номера всех ненайденных треков (для повтора в режиме «максимум»)
     last_done = numbers[0] - 1 if numbers else start - 1
     processed = 0
     stopped = False
@@ -1540,7 +1625,7 @@ async def run_job(chat_id, user_id, start, end, picks=None, kind=None):
 
                 number = numbers[offset]
                 cover = None
-                file_path = None
+                file_paths = []
                 artists = title = ""
                 try:
                     title, artists, cover, duration = await asyncio.to_thread(
@@ -1567,30 +1652,31 @@ async def run_job(chat_id, user_id, start, end, picks=None, kind=None):
                         reply_markup=STOP_KB,
                     )
 
-                    file_path, note, hint = await asyncio.to_thread(
+                    files, hint = await asyncio.to_thread(
                         download_track_public, artists, title, duration, allow_relaxed
                     )
-                    if file_path:
-                        await send_audio_retry(
-                            chat_id,
-                            file_path,
-                            title,
-                            artists,
-                            cover,
-                            f"⚠️ {html.escape(note)}" if note else None,
-                        )
+                    file_paths = [fp for fp, _ in files]
+                    if files:
+                        for fp, note in files:
+                            await send_audio_retry(
+                                chat_id, fp, title, artists, cover,
+                                f"⚠️ {html.escape(note)}" if note else None,
+                            )
                         ok += 1
-                        if note:
-                            flagged.append(f"№{number}: {artists} — {title} ({note})")
+                        first_note = next((n for _, n in files if n), None)
+                        if first_note:
+                            flagged.append(
+                                f"№{number}: {artists} — {title} (прислано вариантов: {len(files)})"
+                            )
                     else:
                         failed.append(f"№{number}: {artists} — {title} ({hint})" if hint else f"№{number}: {artists} — {title}")
-                        if hint and "режим «максимум»" in hint:
-                            relaxable.append(number)
+                        relaxable.append(number)
                 except Exception as e:
                     logging.exception("Ошибка на треке")
                     failed.append(f"№{number}: {artists or 'трек'} {title} (ошибка: {e})")
+                    relaxable.append(number)
                 finally:
-                    for p in (file_path, cover):
+                    for p in file_paths + [cover]:
                         if p and os.path.exists(p):
                             os.remove(p)
 
@@ -1654,7 +1740,7 @@ async def run_job(chat_id, user_id, start, end, picks=None, kind=None):
     rows = []
     if relaxable and not allow_relaxed:
         session["retry"] = list(relaxable)
-        rows.append([btn(f"🌐 Повторить {len(relaxable)} в режиме максимум", "retry")])
+        rows.append([btn(f"🌐 Повторить все {len(relaxable)} в режиме максимум", "retry")])
     if kind == "retry":
         rows.append([btn("⬅️ К плейлисту", "back:card")])
     elif picks:
@@ -1779,7 +1865,8 @@ async def single_job(chat_id, user_id, index, relaxed):
     single_busy.add(user_id)
     item = results[index]
     label = html.escape(f"{item['artists']} — {item['title']}")
-    cover = file_path = None
+    cover = None
+    file_paths = []
     status = None
     try:
         if WORK_LOCK.locked():
@@ -1796,17 +1883,19 @@ async def single_job(chat_id, user_id, index, relaxed):
             title, artists, cover, duration = await asyncio.to_thread(
                 with_retry, catalog_track_info, item
             )
-            file_path, note, hint = await asyncio.to_thread(
+            files, hint = await asyncio.to_thread(
                 download_track_public, artists, title, duration, relaxed
             )
-            if file_path:
-                await send_audio_retry(
-                    chat_id, file_path, title, artists, cover,
-                    f"⚠️ {html.escape(note)}" if note else None,
-                )
+            file_paths = [fp for fp, _ in files]
+            if files:
+                for fp, note in files:
+                    await send_audio_retry(
+                        chat_id, fp, title, artists, cover,
+                        f"⚠️ {html.escape(note)}" if note else None,
+                    )
                 text = "✅ <b>Готово!</b>"
-                if note:
-                    text += f"\n⚠️ {html.escape(note)}"
+                if any(n for _, n in files):
+                    text += f"\n⚠️ Прислано вариантов: {len(files)}. Выберите подходящий на слух."
                 await safe_edit(
                     chat_id, status.message_id, text,
                     kb([btn("🔍 Найти ещё", "single"), btn("🏠 Меню", "back:menu")]),
@@ -1834,7 +1923,7 @@ async def single_job(chat_id, user_id, index, relaxed):
                 kb([btn("🔍 Найти ещё", "single"), btn("🏠 Меню", "back:menu")]),
             )
     finally:
-        for p_ in (file_path, cover):
+        for p_ in file_paths + [cover]:
             if p_ and os.path.exists(p_):
                 os.remove(p_)
         single_busy.discard(user_id)
