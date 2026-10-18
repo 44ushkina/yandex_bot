@@ -1,4 +1,16 @@
 import os
+import sys
+
+# Память на бесплатном Render ограничена. Эта настройка заметно уменьшает «раздувание» памяти
+# при многопоточной работе (yt-dlp, ffmpeg). Она должна быть задана до запуска Python,
+# поэтому один раз перезапускаем процесс с ней.
+if __name__ == "__main__" and sys.platform.startswith("linux") and "MALLOC_ARENA_MAX" not in os.environ:
+    os.environ["MALLOC_ARENA_MAX"] = "2"
+    try:
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception:
+        pass
+
 import gc
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
@@ -433,6 +445,9 @@ TRACK_TIME_LIMIT = 120
 
 # Сколько похожих вариантов присылать сразу в режиме «максимум», если точного совпадения нет
 MAX_VARIANTS = 3
+
+# Качество MP3 в кбит/с (192 это хорошее качество).
+AUDIO_BITRATE = "192"
 
 # Размер одной части при переносе частями
 PART_SIZE = 100
@@ -1022,7 +1037,7 @@ def download_url(url):
     base = {
         "format": "bestaudio/best",
         "postprocessors": [
-            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": AUDIO_BITRATE}
         ],
         "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
         "quiet": True,
@@ -1307,6 +1322,7 @@ def run_diagnostics(query):
     lines.append(f"Cookies: {'есть' if COOKIE_FILE else 'нет'}")
     lines.append(f"WARP-прокси для YouTube: {WARP_STATUS}")
     lines.append(f"Память: {mem_report()}")
+    lines.append(f"Отправлено в Telegram с запуска: {BYTES_SENT / 1048576:.0f} МБ (лимит Render: 5 ГБ в месяц)")
     lines.append(f"YouTube помечен как заблокированный: {'да' if yt_is_blocked() else 'нет'}")
     lines.append(f"Запрос: {query}")
     lines.append("")
@@ -1449,7 +1465,9 @@ INFO_TEXTS = {
         "или выключить телефон: треки будут приходить в чат сами, а когда вы вернётесь, всё уже будет на месте.\n\n"
         "📦 Для больших плейлистов удобнее переносить <b>частями по 100 треков</b>: "
         "после каждой части бот предложит следующую одной кнопкой.\n\n"
-        "⏹ Остановить перенос можно в любой момент кнопкой или командой /stop."
+        "⏹ Остановить перенос можно в любой момент кнопкой или командой /stop.\n\n"
+        "🔁 Если бот перезапустится (бесплатный сервер иногда это делает), отправьте ссылку "
+        "заново и выберите «Свой диапазон», начав с номера следующего за последним присланным треком."
     ),
     "search": (
         "🔎 <b>О поиске</b>\n\n"
@@ -1620,12 +1638,45 @@ async def safe_edit(chat_id, message_id, text, reply_markup=None):
         pass
 
 
+BYTES_SENT = 0  # сколько МБ отправлено в Telegram с запуска бота (Render считает исходящий трафик)
+
+
+# Уже отправленные треки: повторная отправка по file_id не скачивает файл заново и не тратит трафик Render.
+# Кэш хранится в памяти и очищается при перезапуске бота.
+FILE_CACHE = {}
+FILE_CACHE_MAX = 3000
+
+
+async def send_cached(chat_id, key):
+    """Отправляет трек из кэша. True, если получилось."""
+    fid = FILE_CACHE.get(key)
+    if not fid:
+        return False
+    try:
+        await bot.send_audio(chat_id, audio=fid)
+        return True
+    except Exception as e:
+        logging.info(f"Кэшированный файл не отправился ({key}): {e}")
+        FILE_CACHE.pop(key, None)
+        return False
+
+
+def remember_file(key, msg):
+    try:
+        fid = msg.audio.file_id
+    except Exception:
+        return
+    if len(FILE_CACHE) >= FILE_CACHE_MAX:
+        FILE_CACHE.pop(next(iter(FILE_CACHE)))
+    FILE_CACHE[key] = fid
+
+
 async def send_audio_retry(chat_id, file_path, title, artists, cover, caption):
     """Отправляет трек, при сетевых сбоях повторяет попытку до 3 раз."""
     last_error = None
     for attempt in range(3):
         try:
-            await bot.send_audio(
+            msg = await bot.send_audio(
                 chat_id,
                 audio=FSInputFile(file_path),
                 title=title,
@@ -1633,7 +1684,12 @@ async def send_audio_retry(chat_id, file_path, title, artists, cover, caption):
                 thumbnail=FSInputFile(cover) if cover and os.path.exists(cover) else None,
                 caption=caption,
             )
-            return
+            global BYTES_SENT
+            try:
+                BYTES_SENT += os.path.getsize(file_path)
+            except Exception:
+                pass
+            return msg
         except TelegramRetryAfter as e:
             last_error = e
             await asyncio.sleep(e.retry_after + 1)
@@ -1718,22 +1774,50 @@ async def run_job(chat_id, user_id, start, end, picks=None, kind=None):
                         reply_markup=STOP_KB,
                     )
 
-                    files, hint = await asyncio.to_thread(
-                        download_track_public, artists, title, duration, allow_relaxed
-                    )
-                    if not files and kind == "retry":
-                        files = await asyncio.to_thread(deep_search_track, artists, title, duration)
-                        if files:
-                            hint = None
-                        else:
-                            hint = "глубокий поиск тоже ничего не нашёл"
+                    ckey = f"ym:{short_track}"
+                    if await send_cached(chat_id, ckey):
+                        ok += 1
+                        last_done = number
+                        processed += 1
+                        await asyncio.sleep(1)
+                        continue
+
+                    async def search_work():
+                        found, why = await asyncio.to_thread(
+                            download_track_public, artists, title, duration, allow_relaxed
+                        )
+                        if not found and kind == "retry":
+                            found = await asyncio.to_thread(deep_search_track, artists, title, duration)
+                            why = None if found else "глубокий поиск тоже ничего не нашёл"
+                        return found, why
+
+                    # поиск идёт в фоне, поэтому кнопка «Остановить» срабатывает сразу,
+                    # а не после окончания поиска текущего трека
+                    work = asyncio.ensure_future(search_work())
+                    stop_wait = asyncio.ensure_future(stop_event.wait())
+                    await asyncio.wait({work, stop_wait}, return_when=asyncio.FIRST_COMPLETED)
+                    if not work.done():
+                        def _discard(task):
+                            try:
+                                for fp_, _n in task.result()[0]:
+                                    if fp_ and os.path.exists(fp_):
+                                        os.remove(fp_)
+                            except BaseException:
+                                pass
+                        work.add_done_callback(_discard)
+                        stopped = True
+                        break
+                    stop_wait.cancel()
+                    files, hint = work.result()
                     file_paths = [fp for fp, _ in files]
                     if files:
                         for fp, note in files:
-                            await send_audio_retry(
+                            sent_msg = await send_audio_retry(
                                 chat_id, fp, title, artists, cover,
                                 f"⚠️ {html.escape(note)}" if note else None,
                             )
+                            if len(files) == 1 and not note:
+                                remember_file(ckey, sent_msg)
                         ok += 1
                         first_note = next((n for _, n in files if n), None)
                         if first_note:
@@ -1758,9 +1842,11 @@ async def run_job(chat_id, user_id, start, end, picks=None, kind=None):
                 logging.info(f"Память после трека №{number}: {mem_report()}")
 
                 # пауза, чтобы Telegram не ограничил бота за частые отправки
-                await asyncio.sleep(3)
-                if (offset + 1) % 5 == 0:
-                    await asyncio.sleep(10)
+                pause = 3 + (10 if (offset + 1) % 5 == 0 else 0)
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=pause)
+                except asyncio.TimeoutError:
+                    pass
     except Exception:
         logging.exception("Сбой задачи переноса")
     finally:
@@ -1955,6 +2041,13 @@ async def single_job(chat_id, user_id, index, relaxed):
             title, artists, cover, duration = await asyncio.to_thread(
                 with_retry, catalog_track_info, item
             )
+            ckey = f"{item.get('src', 'ym')}:{item['id']}"
+            if await send_cached(chat_id, ckey):
+                await safe_edit(
+                    chat_id, status.message_id, "✅ <b>Готово!</b>",
+                    kb([btn("🔍 Найти ещё", "single"), btn("🏠 Меню", "back:menu")]),
+                )
+                return
             files, hint = await asyncio.to_thread(
                 download_track_public, artists, title, duration, relaxed
             )
@@ -1963,10 +2056,12 @@ async def single_job(chat_id, user_id, index, relaxed):
             file_paths = [fp for fp, _ in files]
             if files:
                 for fp, note in files:
-                    await send_audio_retry(
+                    sent_msg = await send_audio_retry(
                         chat_id, fp, title, artists, cover,
                         f"⚠️ {html.escape(note)}" if note else None,
                     )
+                    if len(files) == 1 and not note:
+                        remember_file(ckey, sent_msg)
                 text = "✅ <b>Готово!</b>"
                 if any(n for _, n in files):
                     text += f"\n⚠️ Прислано вариантов: {len(files)}. Выберите подходящий на слух."
